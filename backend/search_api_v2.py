@@ -78,7 +78,12 @@ def get_embedding_model() -> SentenceTransformer:
             if _embedding_model is None:  # Double-check pattern
                 config = get_config()
                 logger.info(f"Loading embedding model: {config.embedding_model}")
-                _embedding_model = SentenceTransformer(config.embedding_model)
+                try:
+                    _embedding_model = SentenceTransformer(config.embedding_model)
+                    logger.info(f"Embedding model loaded successfully")
+                except Exception as e:
+                    logger.error(f"Failed to load embedding model: {e}")
+                    raise RuntimeError(f"Could not load embedding model '{config.embedding_model}': {e}")
     return _embedding_model
 
 
@@ -89,38 +94,48 @@ def get_qdrant_client() -> QdrantClient:
         with _qdrant_lock:
             if _qdrant_client is None:  # Double-check pattern
                 config = get_config()
-                if config.is_cloud:
-                    logger.info(f"Connecting to Qdrant Cloud: {config.qdrant_url}")
-                    
-                    api_key = config.qdrant_api_key
-                    if not api_key:
-                        logger.warning("API Key missing in config! Attempting direct refetch from .env...")
-                        import os
-                        from dotenv import load_dotenv
-                        load_dotenv(override=True)
-                        api_key = os.getenv("QDRANT_API_KEY")
-                    
-                    if api_key:
+                try:
+                    if config.is_cloud:
+                        logger.info(f"Connecting to Qdrant Cloud: {config.qdrant_url}")
+                        
+                        api_key = config.qdrant_api_key
+                        if not api_key:
+                            logger.warning("API Key missing in config! Attempting direct refetch from .env...")
+                            import os
+                            from dotenv import load_dotenv
+                            load_dotenv(override=True)
+                            api_key = os.getenv("QDRANT_API_KEY")
+                        
+                        if not api_key:
+                            raise ValueError("CRITICAL: Qdrant API Key is MISSING! Check QDRANT_API_KEY in .env file")
+                        
                         logger.info("Qdrant API Key: configured")
+                        
+                        _qdrant_client = QdrantClient(
+                            url=config.qdrant_url,
+                            api_key=api_key,
+                            timeout=30
+                        )
                     else:
-                        logger.error("CRITICAL: Qdrant API Key is MISSING!")
+                        logger.info(f"Using local Qdrant: {config.qdrant_url}")
+                        _qdrant_client = QdrantClient(path=config.qdrant_url)
                     
-                    _qdrant_client = QdrantClient(
-                        url=config.qdrant_url,
-                        api_key=api_key,
-                        timeout=30
-                    )
-                else:
-                    logger.info(f"Using local Qdrant: {config.qdrant_url}")
-                    _qdrant_client = QdrantClient(path=config.qdrant_url)
-    return _qdrant_client
+                    logger.info("Qdrant client initialized successfully")
+                except Exception as e:
+                    logger.error(f"Failed to initialize Qdrant client: {e}")
+                    raise
     return _qdrant_client
 
 
 def get_db_connection() -> duckdb.DuckDBPyConnection:
     """Get DuckDB connection"""
     config = get_config()
-    return duckdb.connect(config.duckdb_path, read_only=True)
+    try:
+        conn = duckdb.connect(config.duckdb_path, read_only=True)
+        return conn
+    except Exception as e:
+        logger.error(f"Failed to connect to DuckDB at {config.duckdb_path}: {e}")
+        raise RuntimeError(f"Could not connect to DuckDB: {e}")
 
 
 def load_skill_relations() -> Dict[str, List[Tuple[str, float]]]:
@@ -893,22 +908,50 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    config = get_config()
-    logger.info("=" * 60)
-    logger.info("  TALENTIN SEARCH API v2")
-    logger.info("=" * 60)
-    logger.info(f"Qdrant: {config.qdrant_url}")
-    logger.info(f"DuckDB: {config.duckdb_path}")
-    logger.info(f"Cloud Mode: {config.is_cloud}")
-    logger.info("=" * 60)
-    
-    # Pre-load models
-    get_embedding_model()
-    load_skill_relations()
-    
-    yield
-    
-    logger.info("Shutting down...")
+    try:
+        config = get_config()
+        logger.info("=" * 60)
+        logger.info("  TALENTIN SEARCH API v2")
+        logger.info("=" * 60)
+        logger.info(f"Qdrant: {config.qdrant_url}")
+        logger.info(f"DuckDB: {config.duckdb_path}")
+        logger.info(f"Cloud Mode: {config.is_cloud}")
+        logger.info("=" * 60)
+        
+        # Pre-load models with error handling
+        try:
+            get_embedding_model()
+            logger.info("Embedding model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load embedding model: {e}")
+            raise
+        
+        try:
+            load_skill_relations()
+            logger.info("Skill relations loaded successfully")
+        except Exception as e:
+            logger.warning(f"Failed to load skill relations: {e}")
+            # Don't fail startup if skill relations can't be loaded
+        
+        try:
+            # Test Qdrant connection
+            qdrant = get_qdrant_client()
+            collections = qdrant.get_collections()
+            logger.info(f"Qdrant connected successfully, {len(collections.collections)} collections found")
+        except Exception as e:
+            logger.error(f"Failed to connect to Qdrant: {e}")
+            raise
+        
+        logger.info("=" * 60)
+        logger.info("  STARTUP COMPLETE - Ready to serve requests")
+        logger.info("=" * 60)
+        
+        yield
+        
+        logger.info("Shutting down...")
+    except Exception as e:
+        logger.critical(f"STARTUP FAILED: {e}")
+        raise
 
 
 app = FastAPI(
