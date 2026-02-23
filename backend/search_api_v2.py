@@ -1631,15 +1631,19 @@ async def smart_search_endpoint(request: SmartSearchQuery):
 
 def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_preference: str = "preferred") -> List[CandidateResultV2]:
     """
-    Smart re-ranking for natural language search.
+    Comprehensive smart re-ranking for natural language search.
     
-    PHILOSOPHY: Candidates matching extracted filters get MASSIVE boosts.
-    This is what makes "python developer in SF" return actual Python devs in SF at the top.
+    Matches across ALL available profile fields:
+    - Skills: exact match in skills[], then fallback to headline/description text
+    - Titles: exact substring + word overlap + headline matching
+    - Location: city/state/country with configurable boost levels
+    - Experience: range match + proximity scoring (closer to ideal = higher)
+    - Companies: current + work history matching
     
     Args:
         results: List of candidates to rank
         filters: Dict with extracted filters (skills, city, titles, etc.)
-        location_preference: "remote" (no location boost), "preferred" (+0.80 boost), "must_match" (+2.0 boost)
+        location_preference: "remote" (no location boost), "preferred" (+0.80 boost), "must_match" (+3.0 boost)
     """
     if not results:
         return results
@@ -1647,65 +1651,82 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
     # Extract filter sets for fast lookup
     target_skills = set(s.lower() for s in (filters.get("skills") or []))
     expanded_skills = set(s.lower() for s in (filters.get("expanded_skills") or []))
-    target_companies = set(c.lower() for c in (filters.get("expanded_companies") or []))
+    target_companies = set(c.lower() for c in (filters.get("companies") or []))
+    expanded_companies = set(c.lower() for c in (filters.get("expanded_companies") or []))
+    all_companies = target_companies | expanded_companies
     target_city = (filters.get("city") or "").lower() if location_preference != "remote" else ""
     target_state = (filters.get("state") or "").lower() if location_preference != "remote" else ""
     target_country = (filters.get("country") or "").lower() if location_preference != "remote" else ""
     min_years = filters.get("min_years")
     max_years = filters.get("max_years")
     target_titles = set(t.lower() for t in (filters.get("titles") or []))
+    # Build title keywords for fuzzy matching (e.g. "software engineer" -> {"software", "engineer"})
+    title_keywords = set()
+    for t in target_titles:
+        title_keywords.update(w for w in t.split() if len(w) > 2)
     
-    logger.info(f"Re-ranking with: location_preference={location_preference}, city='{target_city}', titles={list(target_titles)[:2]}, "
-               f"skills={list(target_skills)[:2]}, exp={min_years}-{max_years}")
+    logger.info(f"Re-ranking {len(results)} candidates with: location_preference={location_preference}, "
+               f"city='{target_city}', titles={list(target_titles)[:2]}, "
+               f"skills={list(target_skills)[:3]}, exp={min_years}-{max_years}")
     
     # Re-rank each result
     reranked = []
-    sf_count = 0
     for result in results:
         bonus = 0.0
         bonus_details = []
+        all_matched_skills = []
         
-        # Track SF candidates
-        profile_city = (result.city or "").lower()
-        if 'san francisco' in profile_city or 'san francisco' in (result.location or "").lower():
-            sf_count += 1
-        
-        # 1. SKILLS MATCH - boost for exact skill matches
+        # ── 1. SKILLS MATCH ──────────────────────────────────────────
         profile_skills = set(s.lower() for s in (result.skills or []))
         
-        # Exact skill matches (what user asked for)
+        # 1a. Exact skill matches in skills[] array (highest confidence)
         exact_matches = target_skills & profile_skills
         if target_skills:
             skill_coverage = len(exact_matches) / len(target_skills)
-            skill_bonus = skill_coverage * 0.25  # Increased to 0.25
+            skill_bonus = skill_coverage * 0.30
             bonus += skill_bonus
+            all_matched_skills.extend(exact_matches)
             if skill_bonus > 0:
                 bonus_details.append(f"skills+{skill_bonus:.2f}")
         
-        # Expanded skill matches (related skills)
+        # 1b. Skills mentioned in headline/description/title (lower confidence fallback)
+        missing_skills = target_skills - exact_matches
+        if missing_skills:
+            profile_text = " ".join([
+                (result.headline or ""),
+                (result.current_title or ""),
+                (result.description or ""),
+            ]).lower()
+            text_matched = set()
+            for skill in missing_skills:
+                if skill in profile_text:
+                    text_matched.add(skill)
+            if text_matched:
+                text_bonus = (len(text_matched) / len(target_skills)) * 0.10  # Lower weight than array match
+                bonus += text_bonus
+                all_matched_skills.extend(text_matched)
+                bonus_details.append(f"skills_text+{text_bonus:.2f}")
+        
+        # 1c. Expanded skill matches (related skills)
         expanded_matches = expanded_skills & profile_skills
         if expanded_skills and not exact_matches:
             expanded_coverage = len(expanded_matches) / len(expanded_skills)
-            bonus += expanded_coverage * 0.12  # Increased to 0.12
+            exp_bonus = expanded_coverage * 0.12
+            bonus += exp_bonus
+            all_matched_skills.extend(expanded_matches)
+            if exp_bonus > 0:
+                bonus_details.append(f"expanded+{exp_bonus:.2f}")
         
-        # 2. LOCATION MATCH - PRIMARY FACTOR when specified
+        # ── 2. LOCATION MATCH ────────────────────────────────────────
         if location_preference != "remote" and target_city:
             profile_location = (result.location or "").lower()
             profile_city = (result.city or "").lower()
             
-            # Determine boost based on location preference
             if location_preference == "must_match":
-                # EXTREME BOOSTING - force location to top
-                city_boost = 3.0
-                state_boost = 1.5
-                country_boost = 0.75
+                city_boost, state_boost, country_boost = 3.0, 1.5, 0.75
             else:  # "preferred"
-                # NORMAL BOOSTING
-                city_boost = 0.80
-                state_boost = 0.40
-                country_boost = 0.25
+                city_boost, state_boost, country_boost = 0.80, 0.40, 0.25
             
-            # Check both formatted location string and city field
             if target_city and (target_city in profile_location or target_city in profile_city):
                 bonus += city_boost
                 bonus_details.append(f"city+{city_boost:.2f}")
@@ -1716,54 +1737,87 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
                 bonus += country_boost
                 bonus_details.append(f"country+{country_boost:.2f}")
         
-        # 3. TITLE MATCH - SECONDARY (right after location) - CRITICAL signal for role matching
+        # ── 3. TITLE MATCH (comprehensive) ────────────────────────────
         profile_title = (result.current_title or "").lower()
+        profile_headline = (result.headline or "").lower()
+        title_matched = False
+        
+        # 3a. Exact substring match in current_title
         for target_title in target_titles:
             if target_title in profile_title:
-                bonus += 0.50  # VERY HIGH - job title is second most important
-                bonus_details.append(f"title+0.50")
+                bonus += 0.50
+                bonus_details.append("title+0.50")
+                title_matched = True
                 break
         
-        # 4. COMPANY MATCH (work history) - TERTIARY
+        # 3b. Word overlap match (e.g. "software engineer" matches "senior software engineer")
+        if not title_matched and title_keywords:
+            title_words = set(w for w in profile_title.split() if len(w) > 2)
+            overlap = title_keywords & title_words
+            if overlap:
+                overlap_ratio = len(overlap) / len(title_keywords)
+                if overlap_ratio >= 0.5:  # At least half the words match
+                    partial_bonus = overlap_ratio * 0.25
+                    bonus += partial_bonus
+                    bonus_details.append(f"title_partial+{partial_bonus:.2f}")
+                    title_matched = True
+        
+        # 3c. Headline match (candidate's self-description often mentions their role)
+        if not title_matched and profile_headline:
+            for target_title in target_titles:
+                if target_title in profile_headline:
+                    bonus += 0.15
+                    bonus_details.append("headline_title+0.15")
+                    break
+        
+        # ── 4. COMPANY MATCH ──────────────────────────────────────────
         profile_company = (result.current_company or "").lower()
-        for target_company in target_companies:
+        for target_company in all_companies:
             if target_company in profile_company:
-                bonus += 0.25  # Company bonus
-                bonus_details.append(f"company+0.25")
+                bonus += 0.25
+                bonus_details.append("company+0.25")
                 break
         
-        # 5. EXPERIENCE MATCH
+        # ── 5. EXPERIENCE MATCH (with proximity scoring) ──────────────
         exp = result.years_experience
         if exp is not None and (min_years is not None or max_years is not None):
-            in_range = True
-            if min_years is not None and exp < min_years:
-                in_range = False
-            if max_years is not None and exp > max_years:
-                in_range = False
+            effective_min = min_years if min_years is not None else 0
+            effective_max = max_years if max_years is not None else 50
             
-            if in_range:
-                bonus += 0.25  # Experience bonus
-                bonus_details.append(f"exp+0.25")
+            if effective_min <= exp <= effective_max:
+                # In range — full bonus
+                bonus += 0.25
+                bonus_details.append("exp+0.25")
             else:
-                # Partial credit based on how close
-                if min_years and max_years:
+                # Out of range — proximity bonus (closer = better)
+                if min_years is not None and max_years is not None:
                     ideal = (min_years + max_years) / 2
-                    diff = abs(exp - ideal)
-                    if diff <= 3:
-                        bonus += 0.13  # Near range bonus
-                        bonus_details.append(f"exp~+0.13")
+                else:
+                    ideal = min_years or max_years or 0
+                diff = abs(exp - ideal)
+                if diff <= 2:
+                    bonus += 0.15
+                    bonus_details.append("exp~+0.15")
+                elif diff <= 5:
+                    bonus += 0.08
+                    bonus_details.append("exp~+0.08")
         
-        # (Title match already handled above in section 3)
+        # ── 6. PROFILE QUALITY BONUS ──────────────────────────────────
+        # Reward complete profiles (they're more useful to recruiters)
+        completeness = result.profile_completeness or 0
+        if completeness > 70:
+            quality_bonus = 0.05
+            bonus += quality_bonus
         
-        # Update score and matched skills
+        # ── FINAL SCORE ───────────────────────────────────────────────
         new_score = min(result.score + bonus, 1.0)
         
         # Log first 5 for debugging
         if len(reranked) < 5:
-            logger.info(f"  Candidate: {result.full_name[:20]} | {profile_city or 'no-city'} | "
+            logger.info(f"  Candidate: {result.full_name[:25]} | {(result.city or 'no-city')[:15]} | "
                        f"base={result.score:.3f} bonus={bonus:.3f} final={new_score:.3f} | {bonus_details}")
         
-        # Create new result with updated score
+        # Create new result with updated score and comprehensive matched skills
         reranked.append(CandidateResultV2(
             forager_id=result.forager_id,
             score=round(new_score, 4),
@@ -1777,24 +1831,23 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
             domain=result.domain,
             profile_completeness=result.profile_completeness,
             skills=result.skills,
-            matched_skills=list(exact_matches) if exact_matches else result.matched_skills,
+            matched_skills=list(set(all_matched_skills)) if all_matched_skills else result.matched_skills,
             headline=result.headline,
+            description=result.description,
             linkedin_url=result.linkedin_url,
-            photo=result.photo
+            photo=result.photo,
+            industry=result.industry
         ))
     
-    # Sort by new score
+    # Sort by new score (highest first)
     reranked.sort(key=lambda x: x.score, reverse=True)
-    
-    # Log summary
-    logger.info(f"SF candidates in initial results: {sf_count}/{len(results)}")
     
     # Log top 3 results for debugging
     if reranked:
         logger.info(f"Top 3 after re-ranking:")
         for i, r in enumerate(reranked[:3]):
             logger.info(f"  {i+1}. {r.full_name} | {r.current_title} | {r.city}, {r.country} | "
-                       f"exp={r.years_experience}y | score={r.score:.3f} | skills={r.matched_skills[:2]}")
+                       f"exp={r.years_experience}y | score={r.score:.3f} | skills={r.matched_skills[:3]}")
     
     return reranked
 

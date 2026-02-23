@@ -1,53 +1,55 @@
 #!/usr/bin/env python3
-"""Quick diagnostic script for smart search."""
-import requests, json, sys
+"""Deeper diagnostic — check Qdrant collection and test queries."""
+import requests, json
 
 BASE = "http://localhost:8001"
 
-# 1. Health check
+# Test 1: Broad query (no location) — should return many
 print("=" * 60)
-print("1. HEALTH CHECK")
-r = requests.get(f"{BASE}/api/v2/health")
-print(f"   Status: {r.status_code} -> {r.json()}")
+print("TEST 1: 'python developer' (no location)")
+r = requests.post(f"{BASE}/api/v2/smart-search", json={"query": "python developer", "limit": 5})
+d = r.json()
+print(f"  Total: {d.get('total_matches')}")
+for i, res in enumerate(d.get("results", [])[:5]):
+    print(f"  [{i+1}] {res.get('full_name','?')} | {res.get('score',0):.3f} | {res.get('city','?')} | Title: {res.get('current_title','?')} | Matched: {res.get('matched_skills',[])[:4]}")
 
-# 2. Smart search test
+# Test 2: Location only 
 print("\n" + "=" * 60)
-print("2. SMART SEARCH TEST: 'python developer in tokyo'")
-r = requests.post(f"{BASE}/api/v2/smart-search", json={
-    "query": "python developer in tokyo",
-    "limit": 5,
-    "location_preference": "preferred"
-})
+print("TEST 2: 'software engineer in tokyo' (location + generic role)")
+r = requests.post(f"{BASE}/api/v2/smart-search", json={"query": "software engineer in tokyo", "limit": 5})
+d = r.json()
+print(f"  Total: {d.get('total_matches')}")
+for i, res in enumerate(d.get("results", [])[:5]):
+    print(f"  [{i+1}] {res.get('full_name','?')} | {res.get('score',0):.3f} | {res.get('city','?')} | Title: {res.get('current_title','?')} | Matched: {res.get('matched_skills',[])[:4]}")
 
-if r.status_code != 200:
-    print(f"   ERROR {r.status_code}: {r.text[:500]}")
-    sys.exit(1)
-
-data = r.json()
-print(f"   Total matches: {data.get('total_matches', 'N/A')}")
-print(f"   Query understanding: {json.dumps(data.get('query_understanding', {}), indent=4)}")
-print(f"   Took: {data.get('took_ms', '?')}ms")
-
-for i, res in enumerate(data.get("results", [])[:5]):
-    print(f"\n   [{i+1}] {res.get('full_name', '?')}")
-    print(f"       Score: {res.get('score', 0):.4f}")
-    print(f"       City: {res.get('city', '?')}, Country: {res.get('country', '?')}")
-    print(f"       Title: {res.get('current_title', '?')}")
-    print(f"       Skills: {(res.get('skills') or [])[:8]}")
-    print(f"       Matched: {res.get('matched_skills', [])}")
-
-# 3. Second test - different query
+# Test 3: Python developer in tokyo
 print("\n" + "=" * 60)
-print("3. SMART SEARCH TEST: 'react frontend engineer'")
-r = requests.post(f"{BASE}/api/v2/smart-search", json={
-    "query": "react frontend engineer",
-    "limit": 5,
-    "location_preference": "preferred"
-})
-data = r.json()
-print(f"   Total matches: {data.get('total_matches', 'N/A')}")
-for i, res in enumerate(data.get("results", [])[:5]):
-    print(f"   [{i+1}] {res.get('full_name', '?')} | Score: {res.get('score', 0):.4f} | Title: {res.get('current_title', '?')} | Skills match: {res.get('matched_skills', [])[:5]}")
+print("TEST 3: 'python developer in tokyo' (specific)")
+r = requests.post(f"{BASE}/api/v2/smart-search", json={"query": "python developer in tokyo", "limit": 5})
+d = r.json()
+print(f"  Total: {d.get('total_matches')}")
+print(f"  Query Understanding: {json.dumps(d.get('query_understanding',{}))}")
+for i, res in enumerate(d.get("results", [])[:5]):
+    print(f"  [{i+1}] {res.get('full_name','?')} | {res.get('score',0):.3f} | {res.get('city','?')} | Title: {res.get('current_title','?')}")
+    print(f"       Skills: {(res.get('skills') or [])[:6]}")
+    print(f"       Matched: {res.get('matched_skills',[])}")
 
+# Test 4: Java developer in bangalore
 print("\n" + "=" * 60)
-print("DONE")
+print("TEST 4: 'java developer in bangalore'")
+r = requests.post(f"{BASE}/api/v2/smart-search", json={"query": "java developer in bangalore", "limit": 5})
+d = r.json()
+print(f"  Total: {d.get('total_matches')}")
+for i, res in enumerate(d.get("results", [])[:5]):
+    print(f"  [{i+1}] {res.get('full_name','?')} | {res.get('score',0):.3f} | {res.get('city','?')} | Title: {res.get('current_title','?')} | Matched: {res.get('matched_skills',[])[:4]}")
+
+# Test 5: Check server logs for enriched search text
+print("\n" + "=" * 60)
+print("TEST 5: Check backend logs")
+import subprocess
+out = subprocess.run(["sudo", "journalctl", "-u", "talentin-backend", "--no-pager", "-n", "30", "--output=cat"], capture_output=True, text=True)
+for line in out.stdout.split("\n"):
+    if "Enriched search text" in line or "Search text for embedding" in line or "Qdrant filter" in line or "Initial Qdrant results" in line:
+        print(f"  LOG: {line.strip()}")
+
+print("\nDONE")
