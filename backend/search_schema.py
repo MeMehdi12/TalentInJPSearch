@@ -108,6 +108,7 @@ class FiltersV2(BaseModel):
     current_company: Optional[str] = Field(None, description="Current company filter (legacy)")
     job_titles: List[str] = Field(default_factory=list, description="Job titles to match semantically")
     schools: List[str] = Field(default_factory=list, description="Schools/universities to filter by")
+    certifications: List[str] = Field(default_factory=list, description="Certifications to match (e.g., 'AWS', 'PMP', 'CPA')")
     industries: List[str] = Field(default_factory=list, description="Industries to filter by")
     first_name: Optional[str] = Field(None, description="Exact first name to filter")
     last_name: Optional[str] = Field(None, description="Exact last name to filter")
@@ -122,7 +123,7 @@ class FiltersV2(BaseModel):
     def clean_strings(cls, v):
         return sanitize_string(v)
     
-    @field_validator('job_titles', 'schools', mode='before')
+    @field_validator('job_titles', 'schools', 'certifications', mode='before')
     @classmethod
     def clean_lists(cls, v):
         return sanitize_string_list(v)
@@ -410,6 +411,16 @@ class CandidateResultV2(BaseModel):
     # Skills
     skills: List[str] = Field(default_factory=list, description="All skills")
     matched_skills: List[str] = Field(default_factory=list, description="Skills that matched query")
+    
+    # Certifications
+    certifications: List[str] = Field(default_factory=list, description="All certifications")
+    matched_certifications: List[str] = Field(default_factory=list, description="Certifications that matched query")
+    
+    # Work History
+    work_history: List[Dict[str, Any]] = Field(default_factory=list, description="Past roles and companies")
+    
+    # Education
+    education: List[Dict[str, Any]] = Field(default_factory=list, description="Educational background")
     
     # URLs
     linkedin_url: Optional[str] = None

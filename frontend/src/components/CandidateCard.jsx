@@ -179,6 +179,11 @@ const CandidateCard = ({ person }) => {
                                     <IconBriefcase size={14} /> {formatText(person.industry)}
                                 </span>
                             )}
+                            {person.years_experience !== undefined && person.years_experience !== null && (
+                                <span className="meta-item" style={{ fontWeight: 500, color: '#0056b3' }}>
+                                    Experience: {person.years_experience}+ years
+                                </span>
+                            )}
                         </div>
                     </div>
 

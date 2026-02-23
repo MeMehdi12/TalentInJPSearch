@@ -470,6 +470,8 @@ def hydrate_profiles_from_duckdb(person_ids: List[int]) -> Dict[int, Dict]:
     conn = get_db_connection()
     try:
         ids_str = ','.join(str(i) for i in person_ids)
+        
+        # Fetch base profile data
         rows = conn.execute(f"""
             SELECT 
                 pp.person_id,
@@ -518,7 +520,66 @@ def hydrate_profiles_from_duckdb(person_ids: List[int]) -> Dict[int, Dict]:
         profiles = {}
         for row in rows:
             profile = dict(zip(columns, row))
-            profiles[profile['forager_id']] = profile
+            fid = profile['forager_id']
+            
+            # Initialize additional fields
+            profile['certifications'] = []
+            profile['work_history'] = []
+            profile['education'] = []
+            
+            profiles[fid] = profile
+        
+        # Fetch certifications
+        cert_rows = conn.execute(f"""
+            SELECT forager_id, certificate_name, issue_date, expiry_date
+            FROM certifications
+            WHERE forager_id IN ({ids_str})
+            ORDER BY issue_date DESC NULLS LAST
+        """).fetchall()
+        
+        for fid, cert_name, issue_date, expiry_date in cert_rows:
+            if fid in profiles and cert_name:
+                profiles[fid]['certifications'].append(cert_name)
+        
+        # Fetch work history (past roles)
+        roles_rows = conn.execute(f"""
+            SELECT forager_id, role_title, company_name, start_date, end_date, 
+                   location, description
+            FROM roles
+            WHERE forager_id IN ({ids_str})
+            ORDER BY start_date DESC NULLS LAST
+            LIMIT 1000
+        """).fetchall()
+        
+        for fid, title, company, start_dt, end_dt, loc, desc in roles_rows:
+            if fid in profiles:
+                profiles[fid]['work_history'].append({
+                    'title': title,
+                    'company': company,
+                    'start_date': str(start_dt) if start_dt else None,
+                    'end_date': str(end_dt) if end_dt else None,
+                    'location': loc,
+                    'description': desc
+                })
+        
+        # Fetch education
+        edu_rows = conn.execute(f"""
+            SELECT forager_id, school_name, degree, field_of_study, 
+                   start_date, end_date
+            FROM educations
+            WHERE forager_id IN ({ids_str})
+            ORDER BY start_date DESC NULLS LAST
+        """).fetchall()
+        
+        for fid, school, degree, field, start_dt, end_dt in edu_rows:
+            if fid in profiles:
+                profiles[fid]['education'].append({
+                    'school': school,
+                    'degree': degree,
+                    'field': field,
+                    'start_date': str(start_dt) if start_dt else None,
+                    'end_date': str(end_dt) if end_dt else None
+                })
         
         return profiles
     finally:
@@ -777,6 +838,10 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
             profile_completeness=profile.get('profile_completeness'),
             skills=profile.get('skills', [])[:15],
             matched_skills=matched_skills,
+            certifications=profile.get('certifications', []),
+            matched_certifications=[],  # Will be calculated in smart_rerank
+            work_history=profile.get('work_history', [])[:10],  # Limit to 10 most recent
+            education=profile.get('education', []),
             headline=profile.get('headline'),
             linkedin_url=profile.get('linkedin_url'),
             linkedin_slug=profile.get('linkedin_slug'),
@@ -1407,6 +1472,7 @@ async def smart_search_endpoint(request: SmartSearchQuery):
             "expanded_skills": [],
             "companies": parsed_result.filters.companies.worked_at,
             "expanded_companies": [],
+            "certifications": parsed_result.filters.certifications if hasattr(parsed_result.filters, 'certifications') else [],
             "city": original_city,
             "state": original_state,
             "country": original_country,
@@ -1481,6 +1547,7 @@ async def smart_search_endpoint(request: SmartSearchQuery):
             "expanded_skills": extracted.expanded_skills if hasattr(extracted, 'expanded_skills') else [],
             "companies": extracted.companies if hasattr(extracted, 'companies') else [],
             "expanded_companies": extracted.expanded_companies if hasattr(extracted, 'expanded_companies') else [],
+            "certifications": extracted.certifications if hasattr(extracted, 'certifications') else [],
             "city": extracted.city,
             "state": extracted.state,
             "country": extracted.country if hasattr(extracted, 'country') else None,
@@ -1490,17 +1557,31 @@ async def smart_search_endpoint(request: SmartSearchQuery):
         }
     
     # 3. Execute search with parsed query
+    logger.info(f"🔍 Executing Qdrant search: text='{parsed_result.search_text[:60]}...', "
+               f"skills={parsed_result.filters.skills.must_have[:3]}, "
+               f"limit={parsed_result.options.limit}")
     response = await search_v2(parsed_result)
     
-    logger.info(f"Qdrant results: {len(response.results)} candidates, "
+    logger.info(f"📊 Qdrant results: {len(response.results)} candidates | "
+               f"took={response.took_ms}ms | "
                f"top scores: {[f'{r.score:.3f}' for r in response.results[:5]]}")
     
-    # Calculate facets from results
-    facets = calculate_location_facets(response.results)
+    # 4. SMART RE-RANKING: Apply comprehensive ranking based on skills, titles, location, etc.
+    # This is what makes smart search "smart" - aggressive bonuses for exact matches
+    logger.info(f"🎯 Applying smart re-ranking to {len(response.results)} candidates...")
+    logger.info(f"   Smart filters: skills={smart_filters.get('skills', [])[:3]}, "
+               f"city={smart_filters.get('city')}, titles={smart_filters.get('titles', [])[:2]}")
+    reranked_results = smart_rerank(response.results, smart_filters, location_preference)
+    logger.info(f"✅ After re-ranking: top_score={reranked_results[0].score:.3f if reranked_results else 0}, "
+               f"candidate='{reranked_results[0].full_name[:30]}' if reranked_results else 'none'")
+    logger.info(f"   Top 5 scores: {[f'{r.score:.3f}' for r in reranked_results[:5]]}")
     
-    # 4. LOCATION MODE HANDLING (no re-ranking — trust Qdrant)
+    # Calculate facets from results
+    facets = calculate_location_facets(reranked_results)
+    
+    # 5. LOCATION MODE HANDLING (post-filtering after re-ranking)
     location_preference = request.location_preference if hasattr(request, 'location_preference') else "preferred"
-    results = response.results
+    results = reranked_results
     
     target_city = smart_filters.get("city")
     target_state = smart_filters.get("state")
@@ -1602,6 +1683,7 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
     target_companies = set(c.lower() for c in (filters.get("companies") or []))
     expanded_companies = set(c.lower() for c in (filters.get("expanded_companies") or []))
     all_companies = target_companies | expanded_companies
+    target_certifications = set(c.lower() for c in (filters.get("certifications") or []))
     target_city = (filters.get("city") or "").lower() if location_preference != "remote" else ""
     target_state = (filters.get("state") or "").lower() if location_preference != "remote" else ""
     target_country = (filters.get("country") or "").lower() if location_preference != "remote" else ""
@@ -1615,7 +1697,7 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
     
     logger.info(f"Re-ranking {len(results)} candidates with: location_preference={location_preference}, "
                f"city='{target_city}', titles={list(target_titles)[:2]}, "
-               f"skills={list(target_skills)[:3]}, exp={min_years}-{max_years}")
+               f"skills={list(target_skills)[:3]}, certs={list(target_certifications)[:2]}, exp={min_years}-{max_years}")
     
     # Re-rank each result
     reranked = []
@@ -1719,14 +1801,52 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
                     break
         
         # ── 4. COMPANY MATCH ──────────────────────────────────────────
+        # 4a. Current company match
         profile_company = (result.current_company or "").lower()
+        company_matched = False
         for target_company in all_companies:
             if target_company in profile_company:
                 bonus += 0.25
-                bonus_details.append("company+0.25")
+                bonus_details.append("curr_company+0.25")
+                company_matched = True
                 break
         
-        # ── 5. EXPERIENCE MATCH (with proximity scoring) ──────────────
+        # 4b. Past company match (work history)
+        if not company_matched and result.work_history:
+            for work_exp in result.work_history[:5]:  # Check top 5 most recent
+                past_company = (work_exp.get('company') or "").lower()
+                for target_company in all_companies:
+                    if target_company in past_company:
+                        bonus += 0.15  # Lower than current company
+                        bonus_details.append("past_company+0.15")
+                        company_matched = True
+                        break
+                if company_matched:
+                    break
+        
+        # ── 5. CERTIFICATION MATCH ────────────────────────────────────
+        matched_certs = []
+        if target_certifications and result.certifications:
+            profile_certs = set(c.lower() for c in result.certifications)
+            # Exact matches
+            exact_cert_matches = target_certifications & profile_certs
+            matched_certs.extend(exact_cert_matches)
+            
+            # Partial matches (e.g., "AWS" matches "AWS Certified Solutions Architect")
+            if not exact_cert_matches:
+                for target_cert in target_certifications:
+                    for profile_cert in result.certifications:
+                        if target_cert in profile_cert.lower():
+                            matched_certs.append(profile_cert)
+                            break
+            
+            if matched_certs:
+                cert_coverage = len(matched_certs) / len(target_certifications)
+                cert_bonus = cert_coverage * 0.20  # Up to +0.20 for all certs matched
+                bonus += cert_bonus
+                bonus_details.append(f"certs+{cert_bonus:.2f}")
+        
+        # ── 6. EXPERIENCE MATCH (with proximity scoring) ──────────────
         exp = result.years_experience
         if exp is not None and (min_years is not None or max_years is not None):
             effective_min = min_years if min_years is not None else 0
@@ -1750,7 +1870,7 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
                     bonus += 0.08
                     bonus_details.append("exp~+0.08")
         
-        # ── 6. PROFILE QUALITY BONUS ──────────────────────────────────
+        # ── 7. PROFILE QUALITY BONUS ──────────────────────────────────
         # Reward complete profiles (they're more useful to recruiters)
         completeness = result.profile_completeness or 0
         if completeness > 70:
@@ -1780,11 +1900,29 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
             profile_completeness=result.profile_completeness,
             skills=result.skills,
             matched_skills=list(set(all_matched_skills)) if all_matched_skills else result.matched_skills,
+            certifications=result.certifications,
+            matched_certifications=list(set(matched_certs)),
+            work_history=result.work_history,
+            education=result.education,
             headline=result.headline,
             description=result.description,
             linkedin_url=result.linkedin_url,
             photo=result.photo,
-            industry=result.industry
+            industry=result.industry,
+            linkedin_slug=result.linkedin_slug,
+            search_name=result.search_name,
+            is_creator=result.is_creator,
+            is_influencer=result.is_influencer,
+            address=result.address,
+            linkedin_country=result.linkedin_country,
+            linkedin_area=result.linkedin_area,
+            date_updated=result.date_updated,
+            primary_locale=result.primary_locale,
+            temporary_status=result.temporary_status,
+            temporary_emoji_status=result.temporary_emoji_status,
+            background_picture=result.background_picture,
+            area=result.area
+        ))
         ))
     
     # Sort by new score (highest first)
@@ -2023,10 +2161,18 @@ async def legacy_search(
             LEFT JOIN persons p ON pp.person_id = p.forager_id
             {join_sql}
             WHERE {where_sql}
-            ORDER BY pp.profile_completeness DESC NULLS LAST, pp.years_experience DESC NULLS LAST
+            ORDER BY 
+                pp.profile_completeness DESC NULLS LAST, 
+                pp.years_experience DESC NULLS LAST,
+                pp.full_name ASC
             LIMIT ? OFFSET ?
         """
         rows = conn.execute(data_sql, params + [page_size, offset]).fetchall()
+        
+        # Build matched_skills tracking for each result
+        search_skills_lower = set()
+        if active_skills:
+            search_skills_lower = set(s.strip().lower() for s in active_skills.split(','))
         
         # Build results
         columns = ['forager_id', 'full_name', 'city', 'state', 'country', 
@@ -2038,9 +2184,13 @@ async def legacy_search(
                    'primary_locale', 'temporary_status', 'temporary_emoji_status',
                    'background_picture', 'area']
         
+        # Collect forager_ids for batch fetching certifications and work history
+        forager_ids = []
         results = []
+        
         for row in rows:
             profile = dict(zip(columns, row))
+            forager_ids.append(profile['forager_id'])
             # Parse skills
             skills_list = []
             if profile.get('skills_raw'):
@@ -2064,6 +2214,12 @@ async def legacy_search(
             loc_parts = [p for p in [profile.get('city'), profile.get('state'), profile.get('country')] if p]
             location_str = ', '.join(loc_parts)
             
+            # Calculate matched_skills
+            matched_skills = []
+            if search_skills_lower and skills_list:
+                profile_skills_lower = set(s.lower() for s in skills_list)
+                matched_skills = [s for s in skills_list if s.lower() in search_skills_lower]
+            
             results.append({
                 "forager_id": str(profile.get('forager_id', '')),
                 "full_name": full_name,
@@ -2079,7 +2235,7 @@ async def legacy_search(
                 "domain": profile.get('domain'),
                 "profile_completeness": profile.get('profile_completeness'),
                 "skills": skills_list,
-                "matched_skills": [],
+                "matched_skills": matched_skills,
                 "headline": profile.get('headline'),
                 "linkedin_url": profile.get('linkedin_url'),
                 "photo": profile.get('photo'),
@@ -2098,7 +2254,54 @@ async def legacy_search(
                 "temporary_emoji_status": profile.get('temporary_emoji_status'),
                 "background_picture": profile.get('background_picture'),
                 "area": profile.get('area'),
+                "certifications": [],  # Will be populated below
+                "work_history": []  # Will be populated below
             })
+        
+        # Batch fetch certifications and work history
+        if forager_ids:
+            ids_str = ','.join(str(fid) for fid in forager_ids)
+            
+            # Fetch certifications
+            cert_rows = conn.execute(f"""
+                SELECT forager_id, certificate_name
+                FROM certifications
+                WHERE forager_id IN ({ids_str})
+                ORDER BY issue_date DESC NULLS LAST
+            """).fetchall()
+            
+            cert_map = {}
+            for fid, cert_name in cert_rows:
+                if fid not in cert_map:
+                    cert_map[fid] = []
+                if cert_name:
+                    cert_map[fid].append(cert_name)
+            
+            # Fetch work history (top 5 most recent per person)
+            work_rows = conn.execute(f"""
+                SELECT forager_id, role_title, company_name, start_date, end_date
+                FROM roles
+                WHERE forager_id IN ({ids_str})
+                ORDER BY start_date DESC NULLS LAST
+                LIMIT 500
+            """).fetchall()
+            
+            work_map = {}
+            for fid, title, company, start_dt, end_dt in work_rows:
+                if fid not in work_map:
+                    work_map[fid] = []
+                work_map[fid].append({
+                    'title': title,
+                    'company': company,
+                    'start_date': str(start_dt) if start_dt else None,
+                    'end_date': str(end_dt) if end_dt else None
+                })
+            
+            # Add to results
+            for result in results:
+                fid = int(result['forager_id'])
+                result['certifications'] = cert_map.get(fid, [])
+                result['work_history'] = work_map.get(fid, [])[:5]  # Limit to 5
         
         conn.close()
         
