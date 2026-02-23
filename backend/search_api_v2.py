@@ -546,34 +546,33 @@ def hydrate_profiles_from_duckdb(person_ids: List[int]) -> Dict[int, Dict]:
         
         # Fetch certifications
         cert_rows = conn.execute(f"""
-            SELECT forager_id, certificate_name, issue_date, expiry_date
+            SELECT forager_id, certificate_name, start, "end"
             FROM certifications
             WHERE forager_id IN ({ids_str})
-            ORDER BY issue_date DESC NULLS LAST
+            ORDER BY start DESC NULLS LAST
         """).fetchall()
         
-        for fid, cert_name, issue_date, expiry_date in cert_rows:
+        for fid, cert_name, cert_start, cert_end in cert_rows:
             if fid in profiles and cert_name:
                 profiles[fid]['certifications'].append(cert_name)
         
         # Fetch work history (past roles)
         roles_rows = conn.execute(f"""
-            SELECT forager_id, role_title, company_name, start_date, end_date, 
-                   location, description
+            SELECT forager_id, role_title, organization_name, start_date, end_date,
+                   description
             FROM roles
             WHERE forager_id IN ({ids_str})
             ORDER BY start_date DESC NULLS LAST
             LIMIT 1000
         """).fetchall()
         
-        for fid, title, company, start_dt, end_dt, loc, desc in roles_rows:
+        for fid, title, company, start_dt, end_dt, desc in roles_rows:
             if fid in profiles:
                 profiles[fid]['work_history'].append({
                     'title': title,
                     'company': company,
                     'start_date': str(start_dt) if start_dt else None,
                     'end_date': str(end_dt) if end_dt else None,
-                    'location': loc,
                     'description': desc
                 })
         
@@ -2336,7 +2335,7 @@ async def legacy_search(
                 SELECT forager_id, certificate_name
                 FROM certifications
                 WHERE forager_id IN ({ids_str})
-                ORDER BY issue_date DESC NULLS LAST
+                ORDER BY start DESC NULLS LAST
             """).fetchall()
             
             cert_map = {}
@@ -2348,7 +2347,7 @@ async def legacy_search(
             
             # Fetch work history (top 5 most recent per person)
             work_rows = conn.execute(f"""
-                SELECT forager_id, role_title, company_name, start_date, end_date
+                SELECT forager_id, role_title, organization_name, start_date, end_date
                 FROM roles
                 WHERE forager_id IN ({ids_str})
                 ORDER BY start_date DESC NULLS LAST

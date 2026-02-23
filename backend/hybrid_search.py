@@ -483,7 +483,7 @@ class HybridSearchService:
             
             # Get roles
             roles = conn.execute("""
-                SELECT company_name, title, start_date, end_date, description
+                SELECT organization_name, role_title, start_date, end_date, description
                 FROM roles
                 WHERE forager_id = ?
                 ORDER BY start_date DESC
@@ -517,7 +517,7 @@ class HybridSearchService:
             
             # Get certifications
             certs = conn.execute("""
-                SELECT certificate_name, authority, license_number
+                SELECT certificate_name, authority, certificate_id
                 FROM certifications
                 WHERE forager_id = ?
             """, [forager_id]).fetchall()
@@ -526,7 +526,7 @@ class HybridSearchService:
                 result["certifications"].append({
                     "name": c[0],
                     "authority": c[1],
-                    "license_number": c[2],
+                    "certificate_id": c[2],
                 })
             
             # Get skills from profile text (or skills table if exists)
