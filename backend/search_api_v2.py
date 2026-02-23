@@ -198,63 +198,76 @@ def expand_skills(skills: List[str], max_per_skill: int = 5) -> Dict[str, List[s
 def build_qdrant_filter(query: ParsedQueryV2) -> Optional[Filter]:
     """
     Build Qdrant filter from parsed query.
-    Normalizes all inputs for robust matching (handles aliases, abbreviations, etc.)
+    Normalizes all inputs for robust matching (handles aliases, abbreviations, case).
     """
     must_conditions = []
     must_not_conditions = []
     filters = query.filters
     
-    # Skills - must_have (AND) - expand aliases
+    def with_case_variations(values: list) -> list:
+        """Add case variations to handle unknown storage format."""
+        expanded = set()
+        for v in values:
+            expanded.add(v.lower())
+            expanded.add(v.title())
+            expanded.add(v.upper())
+            expanded.add(v)  # original
+        return list(expanded)
+    
+    # Skills - must_have (AND) - expand aliases + case variations
     for skill in filters.skills.must_have:
-        # Expand skill to include all variations (python -> ["python", "py", "python3"])
         skill_variations = expand_skill_search([skill])
+        # Add case variations for each alias
+        skill_variations = with_case_variations(skill_variations)
         must_conditions.append(
             FieldCondition(key="skills", match=MatchAny(any=skill_variations))
         )
     
-    # Skills - exclude (NOT) - filter out candidates with these skills
+    # Skills - exclude (NOT)
     for skill in filters.skills.exclude:
         skill_variations = expand_skill_search([skill])
+        skill_variations = with_case_variations(skill_variations)
         must_not_conditions.append(
             FieldCondition(key="skills", match=MatchAny(any=skill_variations))
         )
     
-    # Location - expand to ALL alias variations for matching
-    # Data stored as "united states" but user might search "USA" -> match all variations
+    # Location - HIERARCHY: city > state > country
+    # If city is provided, only filter by city (don't over-filter with state+country)
+    # This prevents zero results when a profile has city but not country, or vice versa
+    from normalizers import CITY_ALIASES, STATE_ALIASES, COUNTRY_ALIASES
+    
     if filters.location.city:
         city_canonical = normalize_city(filters.location.city)
-        # Get all variations for this city
-        from normalizers import CITY_ALIASES
         city_variations = list(CITY_ALIASES.get(city_canonical, {city_canonical}))
+        city_variations = with_case_variations(city_variations)
         must_conditions.append(
             FieldCondition(key="city", match=MatchAny(any=city_variations))
         )
-    if filters.location.state:
+        # DON'T add state/country if city is specified — city is already specific enough
+    elif filters.location.state:
         state_canonical = normalize_state(filters.location.state)
-        from normalizers import STATE_ALIASES
         state_variations = list(STATE_ALIASES.get(state_canonical, {state_canonical}))
+        state_variations = with_case_variations(state_variations)
         must_conditions.append(
             FieldCondition(key="state", match=MatchAny(any=state_variations))
         )
-    if filters.location.country:
+    elif filters.location.country:
         country_canonical = normalize_country(filters.location.country)
-        from normalizers import COUNTRY_ALIASES
         country_variations = list(COUNTRY_ALIASES.get(country_canonical, {country_canonical}))
+        country_variations = with_case_variations(country_variations)
         must_conditions.append(
             FieldCondition(key="country", match=MatchAny(any=country_variations))
         )
     
-    # Companies - worked_at with alias expansion
-    # Google -> ["google", "alphabet", "youtube", "deepmind", ...]
+    # Companies - worked_at with alias expansion + case variations
     if filters.companies.worked_at:
         company_values = expand_company_search(filters.companies.worked_at)
+        company_values = with_case_variations(company_values)
         if filters.companies.current_only:
-            # Only match current company
             must_conditions.append(
                 FieldCondition(key="current_company", match=MatchAny(any=company_values))
             )
         else:
-            # Match ANY company in work history (current OR past)
             must_conditions.append(
                 FieldCondition(key="companies", match=MatchAny(any=company_values))
             )
@@ -262,21 +275,23 @@ def build_qdrant_filter(query: ParsedQueryV2) -> Optional[Filter]:
     # Companies - exclude (NOT)
     for company in filters.companies.exclude:
         company_variations = expand_company_search([company])
+        company_variations = with_case_variations(company_variations)
         must_not_conditions.append(
             FieldCondition(key="companies", match=MatchAny(any=company_variations))
         )
     
-    # Legacy current_company filter - normalize
+    # Legacy current_company filter
     if filters.current_company:
         company_normalized = normalize_company(filters.current_company)
         must_conditions.append(
-            FieldCondition(key="current_company", match=MatchValue(value=company_normalized))
+            FieldCondition(key="current_company", match=MatchAny(any=with_case_variations([company_normalized])))
         )
     
-    # Domain - normalize
+    # Domain
     if filters.domain:
+        domain_val = normalize_text(filters.domain)
         must_conditions.append(
-            FieldCondition(key="domain", match=MatchValue(value=normalize_text(filters.domain)))
+            FieldCondition(key="domain", match=MatchAny(any=with_case_variations([domain_val])))
         )
     
     # Experience range
@@ -288,10 +303,6 @@ def build_qdrant_filter(query: ParsedQueryV2) -> Optional[Filter]:
         must_conditions.append(
             FieldCondition(key="years_experience", range=Range(lte=float(filters.experience.max_years)))
         )
-    
-    # Job titles - NOT a hard filter (would return 0 results with exact match)
-    # Applied as ranking boost in calculate_ranking_bonus() instead
-
     
     if must_conditions or must_not_conditions:
         return Filter(
