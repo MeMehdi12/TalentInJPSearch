@@ -1641,9 +1641,12 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
     logger.info(f"   Smart filters: skills={smart_filters.get('skills', [])[:3]}, "
                f"city={smart_filters.get('city')}, titles={smart_filters.get('titles', [])[:2]}")
     reranked_results = smart_rerank(response.results, smart_filters, location_preference)
-    logger.info(f"✅ After re-ranking: top_score={reranked_results[0].score:.3f if reranked_results else 0}, "
-               f"candidate='{reranked_results[0].full_name[:30]}' if reranked_results else 'none'")
-    logger.info(f"   Top 5 scores: {[f'{r.score:.3f}' for r in reranked_results[:5]]}")
+    if reranked_results:
+        logger.info(f"✅ After re-ranking: top_score={reranked_results[0].score:.3f}, "
+                   f"candidate='{reranked_results[0].full_name[:30]}'")
+        logger.info(f"   Top 5 scores: {[f'{r.score:.3f}' for r in reranked_results[:5]]}")
+    else:
+        logger.info("✅ After re-ranking: no results")
     
     # Calculate facets from results
     facets = calculate_location_facets(reranked_results)
