@@ -907,7 +907,7 @@ import os
 _search_env = os.getenv("SEARCH_ENV", "local").lower()
 
 ALLOWED_ORIGINS = [
-    "https://jpsearch.mehdinamdar.me",
+    "https://jp.talentin.ai",
     "https://talentin.ai",
     "https://www.talentin.io",
 ]
