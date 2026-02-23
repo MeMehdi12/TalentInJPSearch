@@ -231,32 +231,45 @@ def build_qdrant_filter(query: ParsedQueryV2) -> Optional[Filter]:
             FieldCondition(key="skills", match=MatchAny(any=skill_variations))
         )
     
-    # Location - HIERARCHY: city > state > country
-    # If city is provided, only filter by city (don't over-filter with state+country)
-    # This prevents zero results when a profile has city but not country, or vice versa
+    # Location - Search across ALL location payload fields (city, state, country, location)
+    # Data may be stored inconsistently (e.g. city field might have country data)
+    # Use should (OR) across all fields to maximize matching
     from normalizers import CITY_ALIASES, STATE_ALIASES, COUNTRY_ALIASES
     
-    if filters.location.city:
-        city_canonical = normalize_city(filters.location.city)
-        city_variations = list(CITY_ALIASES.get(city_canonical, {city_canonical}))
-        city_variations = with_case_variations(city_variations)
+    location_value = filters.location.city or filters.location.state or filters.location.country
+    if location_value:
+        # Build all possible variations for this location
+        location_lower = location_value.lower().strip()
+        all_variations = set()
+        
+        # Check city aliases
+        city_canonical = normalize_city(location_value)
+        all_variations.update(CITY_ALIASES.get(city_canonical, {city_canonical}))
+        
+        # Check state aliases  
+        state_canonical = normalize_state(location_value)
+        all_variations.update(STATE_ALIASES.get(state_canonical, {state_canonical}))
+        
+        # Check country aliases
+        country_canonical = normalize_country(location_value)
+        all_variations.update(COUNTRY_ALIASES.get(country_canonical, {country_canonical}))
+        
+        # Add raw input
+        all_variations.add(location_lower)
+        
+        # Add case variations
+        all_variations_with_case = with_case_variations(list(all_variations))
+        
+        # Search across ALL location-related Qdrant fields using should (OR)
+        location_conditions = [
+            FieldCondition(key="city", match=MatchAny(any=all_variations_with_case)),
+            FieldCondition(key="state", match=MatchAny(any=all_variations_with_case)),
+            FieldCondition(key="country", match=MatchAny(any=all_variations_with_case)),
+            FieldCondition(key="location", match=MatchAny(any=all_variations_with_case)),
+        ]
+        # Wrap in a nested should (OR) filter — match ANY of these fields
         must_conditions.append(
-            FieldCondition(key="city", match=MatchAny(any=city_variations))
-        )
-        # DON'T add state/country if city is specified — city is already specific enough
-    elif filters.location.state:
-        state_canonical = normalize_state(filters.location.state)
-        state_variations = list(STATE_ALIASES.get(state_canonical, {state_canonical}))
-        state_variations = with_case_variations(state_variations)
-        must_conditions.append(
-            FieldCondition(key="state", match=MatchAny(any=state_variations))
-        )
-    elif filters.location.country:
-        country_canonical = normalize_country(filters.location.country)
-        country_variations = list(COUNTRY_ALIASES.get(country_canonical, {country_canonical}))
-        country_variations = with_case_variations(country_variations)
-        must_conditions.append(
-            FieldCondition(key="country", match=MatchAny(any=country_variations))
+            Filter(should=location_conditions)
         )
     
     # Companies - worked_at with alias expansion + case variations
