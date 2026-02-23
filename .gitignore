@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Database (don't commit local copies)
+*.duckdb
+*.duckdb.wal
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Frontend Build
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Sensitive
+*.pem
+*.key
+credentials.json
+
+# Documentation & Scripts (don't upload to server)
+*.md
+*.bat
+*.txt
+SERVERDETAILS.txt
+PRE_DEPLOYMENT_CHECKLIST.md
+PRODUCTION_READINESS.md
+LOCAL_SETUP.md
+QUICKSTART.md
+DEPLOY_TO_AWS.md
+
+# Inspection scripts
+inspect_*.py
+migrate_from_existing.bat
+start.bat
+
+# Temporary
+tmp/
+temp/
+*.tmp

@@ -1,0 +1,52 @@
+{
+  "_description": "School/University name aliases for search expansion. Keys are canonical names, values are alternate spellings/names.",
+  
+  "university of tokyo": ["東京大学", "東大", "todai", "utokyo", "the university of tokyo"],
+  "kyoto university": ["京都大学", "京大", "kyodai"],
+  "osaka university": ["大阪大学", "阪大", "handai"],
+  "tohoku university": ["東北大学", "tohoku"],
+  "nagoya university": ["名古屋大学", "名大", "meidai"],
+  "hokkaido university": ["北海道大学", "北大", "hokudai"],
+  "kyushu university": ["九州大学", "九大", "kyudai"],
+  "tokyo institute of technology": ["東京工業大学", "東工大", "titech", "tokyo tech"],
+  "keio university": ["慶應義塾大学", "慶應", "慶応", "keio"],
+  "waseda university": ["早稲田大学", "早稲田", "早大", "waseda"],
+  
+  "hitotsubashi university": ["一橋大学", "hitotsubashi"],
+  "kobe university": ["神戸大学", "神大"],
+  "tsukuba university": ["筑波大学", "tsukuba"],
+  "tokyo university of science": ["東京理科大学", "理科大", "tus"],
+  "meiji university": ["明治大学", "明治", "meiji"],
+  "chuo university": ["中央大学", "中央", "chuo"],
+  "hosei university": ["法政大学", "法政", "hosei"],
+  "rikkyo university": ["立教大学", "立教", "rikkyo"],
+  "aoyama gakuin university": ["青山学院大学", "青学", "aoyama"],
+  "sophia university": ["上智大学", "上智", "sophia", "jochi"],
+  "icu": ["国際基督教大学", "international christian university"],
+  
+  "harvard": ["ハーバード", "harvard university", "harvard business school", "hbs"],
+  "stanford": ["スタンフォード", "stanford university", "stanford gsb"],
+  "mit": ["マサチューセッツ工科大学", "massachusetts institute of technology", "mit sloan"],
+  "yale": ["イェール", "yale university"],
+  "princeton": ["プリンストン", "princeton university"],
+  "columbia": ["コロンビア", "columbia university", "columbia business school"],
+  "upenn": ["ペンシルバニア大学", "university of pennsylvania", "wharton"],
+  "uc berkeley": ["カリフォルニア大学バークレー校", "berkeley", "ucb", "haas"],
+  "ucla": ["カリフォルニア大学ロサンゼルス校", "uc los angeles", "ucla anderson"],
+  "caltech": ["カリフォルニア工科大学", "california institute of technology"],
+  "carnegie mellon": ["カーネギーメロン", "cmu", "carnegie mellon university"],
+  "nyu": ["ニューヨーク大学", "new york university", "nyu stern"],
+  
+  "oxford": ["オックスフォード", "oxford university", "university of oxford"],
+  "cambridge": ["ケンブリッジ", "cambridge university", "university of cambridge"],
+  "lse": ["london school of economics", "ロンドン・スクール・オブ・エコノミクス"],
+  "insead": ["インシアード", "insead business school"],
+  
+  "tsinghua": ["清華大学", "清華", "tsinghua university"],
+  "peking university": ["北京大学", "北大", "pku"],
+  "nus": ["national university of singapore", "シンガポール国立大学"],
+  "hku": ["university of hong kong", "香港大学"],
+  
+  "iit": ["indian institute of technology", "インド工科大学", "iit bombay", "iit delhi"],
+  "eth zurich": ["チューリッヒ工科大学", "eth"]
+}
