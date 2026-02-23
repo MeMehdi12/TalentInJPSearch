@@ -556,30 +556,18 @@ def calculate_ranking_bonus(
     # Skills coverage - search across skills array AND text fields (headline, title, description)
     profile_skills = set(s.lower() for s in (profile.get('skills') or []))
     
-    # Build a searchable text pool from headline, title, and description
-    profile_text = " ".join([
-        (profile.get('headline') or ''),
-        (profile.get('current_title') or ''),
-        (profile.get('description') or ''),
-    ]).lower()
-    
-    # Helper: match skill against skills set AND profile text
-    def match_skill(query_skill: str, profile_skills_set: set, text_pool: str) -> Optional[str]:
-        """Match skill via substring in skills[] array or free-text fields"""
+    # Helper: match skill against skills set
+    def match_skill(query_skill: str, profile_skills_set: set) -> Optional[str]:
         query_skill_lower = query_skill.lower()
-        # Check skills array first (higher confidence)
         for ps in profile_skills_set:
             if query_skill_lower in ps or ps in query_skill_lower:
                 return ps
-        # Check headline, title, description as fallback
-        if query_skill_lower in text_pool:
-            return query_skill_lower
         return None
     
-    # Must have skills - match across skills + text
+    # Must have skills - match strictly in skills array
     must_have = [s.lower() for s in query.filters.skills.must_have]
     for skill in must_have:
-        matched_ps = match_skill(skill, profile_skills, profile_text)
+        matched_ps = match_skill(skill, profile_skills)
         if matched_ps:
             matched_skills.append(skill)
     
@@ -587,11 +575,11 @@ def calculate_ranking_bonus(
         coverage = len(matched_skills) / len(must_have)
         bonus += coverage * config.bonus_skills_coverage
     
-    # Nice to have skills boost - also match across skills + text
+    # Nice to have skills boost - match strictly in skills array
     nice_to_have = [s.lower() for s in query.filters.skills.nice_to_have]
     nice_matched = []
     for skill in nice_to_have:
-        matched_ps = match_skill(skill, profile_skills, profile_text)
+        matched_ps = match_skill(skill, profile_skills)
         if matched_ps:
             nice_matched.append(skill)
     matched_skills.extend(nice_matched)
@@ -909,7 +897,7 @@ _search_env = os.getenv("SEARCH_ENV", "local").lower()
 ALLOWED_ORIGINS = [
     "https://jp.talentin.ai",
     "https://talentin.ai",
-    "https://www.talentin.io",
+    "https://www.talentin.ai",
 ]
 
 # Only allow localhost in development mode
