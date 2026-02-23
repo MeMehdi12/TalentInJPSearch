@@ -140,12 +140,39 @@ export const exportExcel = async (filters, limit = 100000) => {
 
 export const smartSearch = async (query, locationPreference = 'preferred', selectedLocations = []) => {
   try {
+    const requestTimestamp = Date.now();
+    const requestId = `${requestTimestamp}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    console.log('='.repeat(60));
+    console.log('🔍 FRONTEND: Making Smart Search Request');
+    console.log('   Request ID:', requestId);
+    console.log('   Query:', query);
+    console.log('   Query Length:', query.length);
+    console.log('   Location Preference:', locationPreference);
+    console.log('   Selected Locations:', selectedLocations);
+    console.log('   Timestamp:', new Date(requestTimestamp).toISOString());
+    console.log('='.repeat(60));
+    
     const response = await smartApi.post('/api/v2/smart-search', {
       query: query,
       limit: 50,
       location_preference: locationPreference,
       selected_locations: selectedLocations
+    }, {
+      headers: {
+        'X-Request-ID': requestId  // Add unique request ID
+      }
     });
+    
+    console.log('✅ FRONTEND: Smart Search Response Received');
+    console.log('   Request ID:', requestId);
+    console.log('   Response Time:', Date.now() - requestTimestamp, 'ms');
+    console.log('   Total Matches:', response.data.total_matches);
+    console.log('   Results Count:', response.data.results?.length || 0);
+    if (response.data.results?.length > 0) {
+      console.log('   First 3 Results:', response.data.results.slice(0, 3).map(r => r.full_name).join(', '));
+    }
+    console.log('='.repeat(60));
 
     // Adapt V2 response to match legacy format expected by CandidateCard
     const adaptedResults = response.data.results.map(r => {

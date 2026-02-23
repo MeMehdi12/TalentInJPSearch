@@ -105,9 +105,17 @@ function App() {
   };
 
   const handleSearch = async () => {
+    // CRITICAL: Clear previous results FIRST to prevent mixing
+    setResults(null);
+    setAllResults([]);
+    setCityBreakdown([]);
+    setFacets(null);
+    
     setLoading(true);
     setError(null);
     setCurrentPage(1);
+
+    console.log('🔍 FRONTEND: Starting Classic Search', { filters, quickSearch });
 
     try {
       const activeFilters = Object.fromEntries(
@@ -118,11 +126,17 @@ function App() {
         activeFilters.quick_search = quickSearch.trim();
       }
       const data = await search(activeFilters, 1, pageSize);
+      console.log('✅ FRONTEND: Classic Search Complete', { 
+        total: data.total,
+        returned: data.data?.length,
+        firstResult: data.data?.[0]?.full_name 
+      });
+      
       setResults(data);
       if (activePage !== 'search') setActivePage('search');
     } catch (err) {
       setError(err.response?.data?.detail || 'Failed to search. Check your API key and connection.');
-      console.error('Search error:', err);
+      console.error('❌ Classic search error:', err);
     } finally {
       setLoading(false);
     }
@@ -132,6 +146,12 @@ function App() {
   const [facets, setFacets] = useState(null);
 
   const handleSmartSearch = async (query, overridePreference = null) => {
+    // CRITICAL: Clear previous results FIRST to prevent mixing
+    setAllResults([]);
+    setCityBreakdown([]);
+    setFacets(null);
+    setResults(null);
+    
     setLoading(true);
     setError(null);
     setCurrentPage(1);
@@ -141,8 +161,16 @@ function App() {
     setCurrentQuery(query);
     const pref = overridePreference || locationPreference;
 
+    console.log('🔍 FRONTEND: Starting Smart Search', { query, pref });
+
     try {
       const data = await smartSearch(query, pref);
+      console.log('✅ FRONTEND: Smart Search Complete', { 
+        total: data.total, 
+        returned: data.data?.length,
+        firstResult: data.data?.[0]?.full_name 
+      });
+      
       setAllResults(data.data || []);
       setCityBreakdown(data.city_breakdown || []);
       setFacets(data.facets || null);
@@ -150,7 +178,7 @@ function App() {
       if (activePage !== 'search') setActivePage('search');
     } catch (err) {
       setError('Smart search failed. Please try again.');
-      console.error(err);
+      console.error('❌ Smart search error:', err);
     } finally {
       setLoading(false);
     }
@@ -261,8 +289,11 @@ function App() {
 
   const switchSearchMode = (mode) => {
     if (mode === searchMode) return; // Already in this mode
+    
+    console.log(`🔄 SWITCHING SEARCH MODE: ${searchMode} → ${mode}`);
+    
+    // CRITICAL: Clear ALL state to prevent result mixing
     setSearchMode(mode);
-    // Reset ALL search state when switching modes
     setResults(null);
     setCurrentPage(1);
     setError(null);
@@ -274,6 +305,7 @@ function App() {
     setSelectedCities(new Set());
     setFacets(null);
     setShowFilters(false);
+    setCitySearch('');
     setFilters({
       first_name: '',
       last_name: '',
@@ -288,6 +320,8 @@ function App() {
       education: '',
       role: '',
     });
+    
+    console.log('✅ Search mode switched, all state cleared');
   };
 
   const renderSearchFilters = () => (
@@ -708,7 +742,10 @@ function App() {
                           ))
                         )
                         .map((person, idx) => (
-                          <CandidateCard key={person.forager_id || idx} person={person} />
+                          <CandidateCard 
+                            key={`${searchMode}-${person.forager_id || person.full_name || idx}`} 
+                            person={person} 
+                          />
                         ))}
                     </div>
 

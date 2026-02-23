@@ -81,7 +81,12 @@ def parse_query_with_openai(
             {"role": "user", "content": f"Parse this query: {query}"}
         ]
         
-        logger.info(f"Parsing query with OpenAI: '{query}'")
+        logger.info("="*60)
+        logger.info(f"🤖 OpenAI Parser: Sending query to GPT")
+        logger.info(f"   Query: '{query}'")
+        logger.info(f"   Query Length: {len(query)}")
+        logger.info(f"   Model: {config.model}")
+        logger.info("="*60)
         
         # Call OpenAI with retry logic
         response = call_openai_with_retry(
