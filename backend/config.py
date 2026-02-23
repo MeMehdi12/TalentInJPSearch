@@ -82,7 +82,7 @@ class Config:
                 qdrant_url=os.getenv("QDRANT_URL", str(base_dir / "Database" / "qdrant_data")),
                 qdrant_api_key=os.getenv("QDRANT_API_KEY"),  # Optional for local
                 duckdb_path=os.getenv("DUCKDB_PATH", str(base_dir / "Database" / "talent_search.duckdb")),
-                embedding_model=os.getenv("EMBEDDING_MODEL", "jinaai/jina-embeddings-v2-base-en"),
+                embedding_model=os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2"),
                 embedding_dim=int(os.getenv("EMBEDDING_DIM", "768")),
             )
         else:
@@ -106,7 +106,7 @@ class Config:
                 qdrant_url=qdrant_url,
                 qdrant_api_key=qdrant_api_key,
                 duckdb_path=duckdb_path,
-                embedding_model=os.getenv("EMBEDDING_MODEL", "jinaai/jina-embeddings-v2-base-en"),
+                embedding_model=os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2"),
                 embedding_dim=int(os.getenv("EMBEDDING_DIM", "768")),
             )
 

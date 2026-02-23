@@ -553,22 +553,33 @@ def calculate_ranking_bonus(
     bonus = 0.0
     matched_skills = []
     
-    # Skills coverage - use substring matching for robustness
+    # Skills coverage - search across skills array AND text fields (headline, title, description)
     profile_skills = set(s.lower() for s in (profile.get('skills') or []))
     
-    # Helper function for substring skill matching
-    def match_skill(query_skill: str, profile_skills_set: set) -> Optional[str]:
-        """Match skill with substring matching: 'python' matches 'python (programming language)'"""
+    # Build a searchable text pool from headline, title, and description
+    profile_text = " ".join([
+        (profile.get('headline') or ''),
+        (profile.get('current_title') or ''),
+        (profile.get('description') or ''),
+    ]).lower()
+    
+    # Helper: match skill against skills set AND profile text
+    def match_skill(query_skill: str, profile_skills_set: set, text_pool: str) -> Optional[str]:
+        """Match skill via substring in skills[] array or free-text fields"""
         query_skill_lower = query_skill.lower()
+        # Check skills array first (higher confidence)
         for ps in profile_skills_set:
             if query_skill_lower in ps or ps in query_skill_lower:
                 return ps
+        # Check headline, title, description as fallback
+        if query_skill_lower in text_pool:
+            return query_skill_lower
         return None
     
-    # Must have skills - use substring matching
+    # Must have skills - match across skills + text
     must_have = [s.lower() for s in query.filters.skills.must_have]
     for skill in must_have:
-        matched_ps = match_skill(skill, profile_skills)
+        matched_ps = match_skill(skill, profile_skills, profile_text)
         if matched_ps:
             matched_skills.append(skill)
     
@@ -576,11 +587,11 @@ def calculate_ranking_bonus(
         coverage = len(matched_skills) / len(must_have)
         bonus += coverage * config.bonus_skills_coverage
     
-    # Nice to have skills boost - also substring matching
+    # Nice to have skills boost - also match across skills + text
     nice_to_have = [s.lower() for s in query.filters.skills.nice_to_have]
     nice_matched = []
     for skill in nice_to_have:
-        matched_ps = match_skill(skill, profile_skills)
+        matched_ps = match_skill(skill, profile_skills, profile_text)
         if matched_ps:
             nice_matched.append(skill)
     matched_skills.extend(nice_matched)
@@ -673,16 +684,16 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
     timings['skill_expansion'] = int((time.time() - t0) * 1000)
     
     # 2. Build enhanced search text for better embeddings
-    # Combine search_text + skills + titles + location for grounded embedding
+    # Location filtering is handled by Qdrant filters (build_qdrant_filter).
+    # Only mention location once here for light semantic context.
     search_text = query.search_text or ""
     
-    # Add location HEAVILY for geo-context emphasis (LOCATION IS PRIMARY)
+    # Add location once for semantic context (filtering is done by Qdrant)
     location_parts = []
     if query.filters.location.city:
-        # Repeat city 10 times to DOMINATE the semantic search
-        location_parts.extend([query.filters.location.city] * 10)
+        location_parts.append(query.filters.location.city)
     if query.filters.location.state:
-        location_parts.extend([query.filters.location.state] * 2)
+        location_parts.append(query.filters.location.state)
     if query.filters.location.country:
         location_parts.append(query.filters.location.country)
     if location_parts:
@@ -695,10 +706,6 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
     # Add top skills for grounding
     if search_skills:
         search_text += " " + " ".join(search_skills[:5])
-    
-    # Add location AGAIN at the end for reinforcement (another 5 times)
-    if query.filters.location.city:
-        search_text += " " + " ".join([query.filters.location.city] * 5)
     
     # Fallback if still empty
     if not search_text.strip():
