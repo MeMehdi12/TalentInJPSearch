@@ -1382,136 +1382,75 @@ async def smart_search_endpoint(request: SmartSearchQuery):
                    f"Titles: {parsed_result.filters.job_titles[:2]}, "
                    f"City: {parsed_result.filters.location.city}, Cost: ${cost:.6f}")
         
-        # Use OpenAI result directly
-        # Adjust limit for re-ranking - FETCH MORE candidates
-        # For "must_match" mode, fetch even MORE since we'll hard filter by location
-        if location_preference == "must_match":
-            parsed_result.options.limit = min(limit * 40, 2000)  # Fetch 2000 for must_match
-            logger.info(f"MUST_MATCH mode: Fetching {parsed_result.options.limit} candidates for location filtering")
-        else:
-            parsed_result.options.limit = min(limit * 5, 200)  # Normal: 200 candidates
+        # Fetch more candidates than needed so we get good results after scoring
+        parsed_result.options.limit = min(limit * 5, 500)
         
-        # CRITICAL: Save filter values BEFORE clearing for re-ranking
-        original_city = parsed_result.filters.location.city
-        original_state = parsed_result.filters.location.state
-        original_skills = parsed_result.filters.skills.must_have.copy()
-        original_min_years = parsed_result.filters.experience.min_years
-        original_max_years = parsed_result.filters.experience.max_years
-        
-        # ============================================================
-        # ENRICH search_text BEFORE clearing filters
-        # Since smart search drops ALL hard Qdrant filters, the dense
-        # vector embedding is the ONLY signal Qdrant uses to retrieve 
-        # candidates. We must heavily weight the extracted entities 
-        # in the text so the embedding captures them strongly.
-        # ============================================================
+        # KEEP all Qdrant filters — let Qdrant do what it's built for.
+        # Skills, location, experience all stay as hard filters on the vector search.
+        # Only enrich the search_text with titles for better semantic matching
+        # (titles are not a Qdrant payload field, so they rely on embedding similarity).
         enriched = parsed_result.search_text or request.query
-        
-        # Add job titles (5x) — most important signal for role matching
         if parsed_result.filters.job_titles:
-            enriched += " " + " ".join(parsed_result.filters.job_titles * 5)
-        
-        # Add skills (3x) — strong signal for competency matching
-        if original_skills:
-            enriched += " " + " ".join(original_skills[:5] * 3)
-        
-        # Add location (5x city, 3x state) — critical for geo-relevance
-        if original_city:
-            enriched += " " + " ".join([original_city] * 5)
-        if original_state:
-            enriched += " " + " ".join([original_state] * 3)
-        if parsed_result.filters.location.country:
-            enriched += " " + parsed_result.filters.location.country
-        
+            enriched += " " + " ".join(parsed_result.filters.job_titles)
         parsed_result.search_text = enriched.strip()
-        logger.info(f"Enriched search text: '{parsed_result.search_text[:120]}'")
-        # ============================================================
         
-        # CRITICAL: For smart search, move must_have skills to nice_to_have
-        # Clear ALL hard filters - let semantic search find relevant candidates
-        # Then use filters for RE-RANKING, not blocking
-        if parsed_result.filters.skills.must_have:
-            parsed_result.filters.skills.nice_to_have.extend(parsed_result.filters.skills.must_have)
-            parsed_result.filters.skills.must_have = []
-        
-        # Clear ALL hard filters for smart search (rely on semantic matching + re-ranking)
-        parsed_result.filters.location.city = None
-        parsed_result.filters.location.state = None
-        parsed_result.filters.location.country = None
-        parsed_result.filters.domain = None
-        parsed_result.filters.experience.min_years = None
-        parsed_result.filters.experience.max_years = None
-        
-        # Extract for re-ranking (use original values before clearing)
+        # Build smart_filters for lightweight re-ranking (fine-tuning order, not primary matching)
         smart_filters = {
-            "skills": original_skills + parsed_result.filters.skills.nice_to_have,
+            "skills": parsed_result.filters.skills.must_have + parsed_result.filters.skills.nice_to_have,
             "expanded_skills": [],
             "companies": parsed_result.filters.companies.worked_at,
             "expanded_companies": [],
-            "city": original_city,
-            "state": original_state,
-            "country": None,
-            "min_years": original_min_years,
-            "max_years": original_max_years,
+            "city": parsed_result.filters.location.city,
+            "state": parsed_result.filters.location.state,
+            "country": parsed_result.filters.location.country,
+            "min_years": parsed_result.filters.experience.min_years,
+            "max_years": parsed_result.filters.experience.max_years,
             "titles": parsed_result.filters.job_titles,
         }
         
-        logger.info(f"Smart filters for re-ranking: skills={smart_filters['skills'][:3]}, "
-                   f"city={smart_filters['city']}, titles={smart_filters['titles'][:2]}, "
-                   f"exp={smart_filters['min_years']}-{smart_filters['max_years']}")
+        logger.info(f"Qdrant will filter: skills={parsed_result.filters.skills.must_have[:3]}, "
+                   f"city={parsed_result.filters.location.city}, "
+                   f"exp={parsed_result.filters.experience.min_years}-{parsed_result.filters.experience.max_years}")
     else:
         # Fallback to regex preprocessor
         logger.warning(f"⚠️ OpenAI parsing failed, using regex fallback")
         extracted = smart_preprocess(request.query)
         logger.info(f"Extracted - Skills: {extracted.skills[:3]}, City: {extracted.city}, Titles: {extracted.titles[:2]}")
         
-        # Build ParsedQueryV2 from regex extraction (keep existing logic)
+        # Build ParsedQueryV2 from regex extraction — KEEP filters for Qdrant
         from search_schema import (
             ParsedQueryV2, SkillFiltersV2, ExperienceFilterV2, LocationFilterV2,
             CompanyFilterV2, FiltersV2, SearchOptionsV2
         )
         
-        primary_skills = extracted.skills[:2] if len(extracted.skills) >= 2 else extracted.skills[:1]
-        secondary_skills = extracted.skills[2:] if len(extracted.skills) > 2 else []
+        # Use primary skills as hard filters (Qdrant payload matching)
+        primary_skills = extracted.skills[:3]
+        secondary_skills = extracted.skills[3:]
         
-        # For smart search, don't use hard filters - rely on semantic search + re-ranking
-        primary_filters = []  # No hard skill filters
-        nice_to_have = extracted.skills + secondary_skills  # All skills as nice-to-have
-        
-        # No hard location filters - use for ranking instead
-        city_filter = None
-        state_filter = None
-        
+        # Enrich search text with titles (not a Qdrant payload field)
         enhanced_search_text = extracted.search_text
-        # Apply heavy weighting like OpenAI path (search_v2 won't add more since filters are cleared)
         if extracted.titles:
-            enhanced_search_text += " " + " ".join(extracted.titles[:3] * 5)
-        if extracted.skills:
-            enhanced_search_text += " " + " ".join(extracted.skills[:5] * 3)
-        if extracted.city:
-            enhanced_search_text += " " + " ".join([extracted.city] * 5)
-        if extracted.state and not extracted.city:
-            enhanced_search_text += " " + " ".join([extracted.state] * 3)
+            enhanced_search_text += " " + " ".join(extracted.titles[:3])
         
         parsed_result = ParsedQueryV2(
             search_text=enhanced_search_text.strip(),
             filters=FiltersV2(
                 skills=SkillFiltersV2(
-                    must_have=[],  # No hard filters for smart search
-                    nice_to_have=nice_to_have + extracted.expanded_skills[:8],
+                    must_have=primary_skills,   # KEEP as Qdrant filters
+                    nice_to_have=secondary_skills + extracted.expanded_skills[:8],
                     exclude=[]
                 ),
                 experience=ExperienceFilterV2(
                     min_years=extracted.min_years,
-                    max_years=extracted.max_years
+                    max_years=extracted.max_years  # KEEP as Qdrant filter
                 ),
                 location=LocationFilterV2(
-                    city=city_filter,
-                    state=state_filter,
-                    country=None
+                    city=extracted.city,      # KEEP as Qdrant filter
+                    state=extracted.state,    # KEEP
+                    country=extracted.country  # KEEP
                 ),
                 companies=CompanyFilterV2(
-                    worked_at=[],
+                    worked_at=extracted.companies if hasattr(extracted, 'companies') else [],
                     current_only=False
                 ),
                 job_titles=extracted.titles,
@@ -1519,19 +1458,19 @@ async def smart_search_endpoint(request: SmartSearchQuery):
                 current_company=None
             ),
             options=SearchOptionsV2(
-                limit=min(limit * 40, 2000) if location_preference == "must_match" else min(limit * 3, 100),
+                limit=min(limit * 5, 500),
                 expand_skills=True
             )
         )
         
         smart_filters = {
             "skills": extracted.skills,
-            "expanded_skills": extracted.expanded_skills,
-            "companies": extracted.companies,
-            "expanded_companies": extracted.expanded_companies,
+            "expanded_skills": extracted.expanded_skills if hasattr(extracted, 'expanded_skills') else [],
+            "companies": extracted.companies if hasattr(extracted, 'companies') else [],
+            "expanded_companies": extracted.expanded_companies if hasattr(extracted, 'expanded_companies') else [],
             "city": extracted.city,
             "state": extracted.state,
-            "country": extracted.country,
+            "country": extracted.country if hasattr(extracted, 'country') else None,
             "min_years": extracted.min_years,
             "max_years": extracted.max_years,
             "titles": extracted.titles,
