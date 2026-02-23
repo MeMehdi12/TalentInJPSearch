@@ -1,0 +1,33 @@
+# =============================================================================
+# TALENTIN PRODUCTION DEPLOYMENT - Requirements
+# =============================================================================
+
+# --- Core API Server ---
+fastapi==0.110.0
+uvicorn[standard]==0.27.0
+pydantic==2.6.0
+python-dotenv==1.0.0
+
+# --- Databases ---
+duckdb==1.4.2           # SQL database for talent profiles
+qdrant-client==1.17.0   # Vector database (hybrid search)
+
+# --- ML/Embeddings ---
+sentence-transformers==2.5.0  # all-mpnet-base-v2 embeddings
+torch==2.2.0                  # PyTorch for transformers
+
+# --- OpenAI Integration ---
+openai==1.12.0          # GPT-4o-mini query parsing
+tenacity==8.2.0         # Retry logic with exponential backoff
+
+# --- Data Processing ---
+numpy==1.26.0
+pandas==2.2.0
+pyarrow==15.0.0        # Parquet support for DuckDB
+
+# --- Text Processing & Search ---
+rapidfuzz==3.6.0       # Fuzzy matching for company/skill normalization
+
+# --- Optional Production ---
+python-multipart==0.0.9  # File uploads support
+aiofiles==23.2.1         # Async file operations

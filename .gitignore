@@ -1,4 +1,4 @@
-# Python
+# ─── Python ───────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -8,74 +8,46 @@ venv/
 env/
 ENV/
 *.egg-info/
-dist/
 build/
 
-# Environment
+# ─── Environment & Secrets ────────────────────────────────
 .env
 .env.local
 .env.production
+*.pem
+*.key
+credentials.json
 
-# Database (don't commit local copies)
+# ─── Database ─────────────────────────────────────────────
 *.duckdb
 *.duckdb.wal
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Node
+# ─── Node / Frontend ──────────────────────────────────────
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
-
-# Frontend Build
 frontend/dist/
 frontend/.vite/
 frontend/.cache/
+dist/
 
-# Logs
+# ─── Logs ─────────────────────────────────────────────────
 *.log
 logs/
 
-# OS
+# ─── IDE / OS ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Sensitive
-*.pem
-*.key
-credentials.json
-
-# Documentation & Scripts (don't upload to server)
-*.md
-*.bat
-*.txt
-SERVERDETAILS.txt
-PRE_DEPLOYMENT_CHECKLIST.md
-PRODUCTION_READINESS.md
-LOCAL_SETUP.md
-QUICKSTART.md
-DEPLOY_TO_AWS.md
-
-# Inspection scripts
-inspect_*.py
-migrate_from_existing.bat
-start.bat
-
-# Temporary
+# ─── Temporary ────────────────────────────────────────────
 tmp/
 temp/
 *.tmp
-
-node_modules/
-.env
-*.pem
-dist/
-.DS_Store
