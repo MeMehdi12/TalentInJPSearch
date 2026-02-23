@@ -676,7 +676,9 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
     # Only mention location once here for light semantic context.
     search_text = query.search_text or ""
     
-    # Add location once for semantic context (filtering is done by Qdrant)
+    # Add location for light semantic context (hard filtering is done by Qdrant filters)
+    # NOTE: For smart_search, the search_text is pre-enriched in the endpoint before filters
+    # are cleared, so these will be no-ops (filters.location.city will be None).
     location_parts = []
     if query.filters.location.city:
         location_parts.append(query.filters.location.city)
@@ -684,6 +686,7 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
         location_parts.append(query.filters.location.state)
     if query.filters.location.country:
         location_parts.append(query.filters.location.country)
+    
     if location_parts:
         search_text += " " + " ".join(location_parts)
     
@@ -1395,6 +1398,35 @@ async def smart_search_endpoint(request: SmartSearchQuery):
         original_min_years = parsed_result.filters.experience.min_years
         original_max_years = parsed_result.filters.experience.max_years
         
+        # ============================================================
+        # ENRICH search_text BEFORE clearing filters
+        # Since smart search drops ALL hard Qdrant filters, the dense
+        # vector embedding is the ONLY signal Qdrant uses to retrieve 
+        # candidates. We must heavily weight the extracted entities 
+        # in the text so the embedding captures them strongly.
+        # ============================================================
+        enriched = parsed_result.search_text or request.query
+        
+        # Add job titles (5x) — most important signal for role matching
+        if parsed_result.filters.job_titles:
+            enriched += " " + " ".join(parsed_result.filters.job_titles * 5)
+        
+        # Add skills (3x) — strong signal for competency matching
+        if original_skills:
+            enriched += " " + " ".join(original_skills[:5] * 3)
+        
+        # Add location (5x city, 3x state) — critical for geo-relevance
+        if original_city:
+            enriched += " " + " ".join([original_city] * 5)
+        if original_state:
+            enriched += " " + " ".join([original_state] * 3)
+        if parsed_result.filters.location.country:
+            enriched += " " + parsed_result.filters.location.country
+        
+        parsed_result.search_text = enriched.strip()
+        logger.info(f"Enriched search text: '{parsed_result.search_text[:120]}'")
+        # ============================================================
+        
         # CRITICAL: For smart search, move must_have skills to nice_to_have
         # Clear ALL hard filters - let semantic search find relevant candidates
         # Then use filters for RE-RANKING, not blocking
@@ -1451,14 +1483,15 @@ async def smart_search_endpoint(request: SmartSearchQuery):
         state_filter = None
         
         enhanced_search_text = extracted.search_text
-        if extracted.skills:
-            enhanced_search_text += " " + " ".join(extracted.skills[:5])
-        if extracted.city:
-            enhanced_search_text += f" {extracted.city}"
-        if extracted.state and not extracted.city:
-            enhanced_search_text += f" {extracted.state}"
+        # Apply heavy weighting like OpenAI path (search_v2 won't add more since filters are cleared)
         if extracted.titles:
-            enhanced_search_text += " " + " ".join(extracted.titles[:3])
+            enhanced_search_text += " " + " ".join(extracted.titles[:3] * 5)
+        if extracted.skills:
+            enhanced_search_text += " " + " ".join(extracted.skills[:5] * 3)
+        if extracted.city:
+            enhanced_search_text += " " + " ".join([extracted.city] * 5)
+        if extracted.state and not extracted.city:
+            enhanced_search_text += " " + " ".join([extracted.state] * 3)
         
         parsed_result = ParsedQueryV2(
             search_text=enhanced_search_text.strip(),
