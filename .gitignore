@@ -73,3 +73,9 @@ start.bat
 tmp/
 temp/
 *.tmp
+
+node_modules/
+.env
+*.pem
+dist/
+.DS_Store
