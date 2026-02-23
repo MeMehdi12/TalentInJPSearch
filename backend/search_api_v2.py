@@ -231,46 +231,11 @@ def build_qdrant_filter(query: ParsedQueryV2) -> Optional[Filter]:
             FieldCondition(key="skills", match=MatchAny(any=skill_variations))
         )
     
-    # Location - Search across ALL location payload fields (city, state, country, location)
-    # Data may be stored inconsistently (e.g. city field might have country data)
-    # Use should (OR) across all fields to maximize matching
-    from normalizers import CITY_ALIASES, STATE_ALIASES, COUNTRY_ALIASES
-    
-    location_value = filters.location.city or filters.location.state or filters.location.country
-    if location_value:
-        # Build all possible variations for this location
-        location_lower = location_value.lower().strip()
-        all_variations = set()
-        
-        # Check city aliases
-        city_canonical = normalize_city(location_value)
-        all_variations.update(CITY_ALIASES.get(city_canonical, {city_canonical}))
-        
-        # Check state aliases  
-        state_canonical = normalize_state(location_value)
-        all_variations.update(STATE_ALIASES.get(state_canonical, {state_canonical}))
-        
-        # Check country aliases
-        country_canonical = normalize_country(location_value)
-        all_variations.update(COUNTRY_ALIASES.get(country_canonical, {country_canonical}))
-        
-        # Add raw input
-        all_variations.add(location_lower)
-        
-        # Add case variations
-        all_variations_with_case = with_case_variations(list(all_variations))
-        
-        # Search across ALL location-related Qdrant fields using should (OR)
-        location_conditions = [
-            FieldCondition(key="city", match=MatchAny(any=all_variations_with_case)),
-            FieldCondition(key="state", match=MatchAny(any=all_variations_with_case)),
-            FieldCondition(key="country", match=MatchAny(any=all_variations_with_case)),
-            FieldCondition(key="location", match=MatchAny(any=all_variations_with_case)),
-        ]
-        # Wrap in a nested should (OR) filter — match ANY of these fields
-        must_conditions.append(
-            Filter(should=location_conditions)
-        )
+    # Location: NOT used as a hard Qdrant filter
+    # Reason: (1) location data is stored inconsistently across payload fields,
+    # (2) the dense vector embedding already captures location semantics from search text,
+    # (3) the smart_rerank function handles location boost via profile hydration from DuckDB.
+    # Skills and experience work reliably as hard filters since their payload fields are consistent.
     
     # Companies - worked_at with alias expansion + case variations
     if filters.companies.worked_at:
@@ -1406,72 +1371,96 @@ async def smart_search_endpoint(request: SmartSearchQuery):
                    f"Titles: {parsed_result.filters.job_titles[:2]}, "
                    f"City: {parsed_result.filters.location.city}, Cost: ${cost:.6f}")
         
-        # Fetch more candidates than needed so we get good results after scoring
-        parsed_result.options.limit = min(limit * 5, 500)
+        # Save original location before clearing
+        original_city = parsed_result.filters.location.city
+        original_state = parsed_result.filters.location.state
+        original_country = parsed_result.filters.location.country
         
-        # KEEP all Qdrant filters — let Qdrant do what it's built for.
-        # Skills, location, experience all stay as hard filters on the vector search.
-        # Only enrich the search_text with titles for better semantic matching
-        # (titles are not a Qdrant payload field, so they rely on embedding similarity).
+        # Fetch more candidates — for must_match we need extra since we post-filter
+        if location_preference == "must_match":
+            parsed_result.options.limit = min(limit * 20, 1000)
+        else:
+            parsed_result.options.limit = min(limit * 5, 500)
+        
+        # Enrich search_text with titles + location for semantic matching
+        # (these are NOT hard Qdrant filters — they rely on embedding similarity)
         enriched = parsed_result.search_text or request.query
         if parsed_result.filters.job_titles:
             enriched += " " + " ".join(parsed_result.filters.job_titles)
+        if parsed_result.filters.location.city:
+            enriched += " " + parsed_result.filters.location.city
+        if parsed_result.filters.location.state:
+            enriched += " " + parsed_result.filters.location.state
+        if parsed_result.filters.location.country:
+            enriched += " " + parsed_result.filters.location.country
         parsed_result.search_text = enriched.strip()
         
-        # Build smart_filters for lightweight re-ranking (fine-tuning order, not primary matching)
+        # Clear location from Qdrant filter (data is stored inconsistently in Qdrant payload)
+        # Location is handled by: embedding similarity (preferred) + post-filter (must_match)
+        parsed_result.filters.location.city = None
+        parsed_result.filters.location.state = None
+        parsed_result.filters.location.country = None
+        
+        # Build smart_filters for post-processing (location modes, query understanding)
         smart_filters = {
             "skills": parsed_result.filters.skills.must_have + parsed_result.filters.skills.nice_to_have,
             "expanded_skills": [],
             "companies": parsed_result.filters.companies.worked_at,
             "expanded_companies": [],
-            "city": parsed_result.filters.location.city,
-            "state": parsed_result.filters.location.state,
-            "country": parsed_result.filters.location.country,
+            "city": original_city,
+            "state": original_state,
+            "country": original_country,
             "min_years": parsed_result.filters.experience.min_years,
             "max_years": parsed_result.filters.experience.max_years,
             "titles": parsed_result.filters.job_titles,
         }
         
-        logger.info(f"Qdrant will filter: skills={parsed_result.filters.skills.must_have[:3]}, "
-                   f"city={parsed_result.filters.location.city}, "
-                   f"exp={parsed_result.filters.experience.min_years}-{parsed_result.filters.experience.max_years}")
+        logger.info(f"Search: text='{parsed_result.search_text[:80]}', "
+                   f"skills_filter={parsed_result.filters.skills.must_have[:3]}, "
+                   f"location_mode={location_preference}, location={original_city or original_state or original_country}")
     else:
         # Fallback to regex preprocessor
         logger.warning(f"⚠️ OpenAI parsing failed, using regex fallback")
         extracted = smart_preprocess(request.query)
         logger.info(f"Extracted - Skills: {extracted.skills[:3]}, City: {extracted.city}, Titles: {extracted.titles[:2]}")
         
-        # Build ParsedQueryV2 from regex extraction — KEEP filters for Qdrant
+        # Build ParsedQueryV2 from regex extraction
         from search_schema import (
             ParsedQueryV2, SkillFiltersV2, ExperienceFilterV2, LocationFilterV2,
             CompanyFilterV2, FiltersV2, SearchOptionsV2
         )
         
-        # Use primary skills as hard filters (Qdrant payload matching)
+        # Skills as hard Qdrant filters
         primary_skills = extracted.skills[:3]
         secondary_skills = extracted.skills[3:]
         
-        # Enrich search text with titles (not a Qdrant payload field)
+        # Enrich search text with titles + location for semantic matching
         enhanced_search_text = extracted.search_text
         if extracted.titles:
             enhanced_search_text += " " + " ".join(extracted.titles[:3])
+        if extracted.city:
+            enhanced_search_text += " " + extracted.city
+        if extracted.state:
+            enhanced_search_text += " " + extracted.state
+        if hasattr(extracted, 'country') and extracted.country:
+            enhanced_search_text += " " + extracted.country
         
         parsed_result = ParsedQueryV2(
             search_text=enhanced_search_text.strip(),
             filters=FiltersV2(
                 skills=SkillFiltersV2(
-                    must_have=primary_skills,   # KEEP as Qdrant filters
-                    nice_to_have=secondary_skills + extracted.expanded_skills[:8],
+                    must_have=primary_skills,
+                    nice_to_have=secondary_skills + (extracted.expanded_skills[:8] if hasattr(extracted, 'expanded_skills') else []),
                     exclude=[]
                 ),
                 experience=ExperienceFilterV2(
                     min_years=extracted.min_years,
-                    max_years=extracted.max_years  # KEEP as Qdrant filter
+                    max_years=extracted.max_years
                 ),
                 location=LocationFilterV2(
-                    city=extracted.city,      # KEEP as Qdrant filter
-                    state=extracted.state,    # KEEP
-                    country=extracted.country  # KEEP
+                    city=None,      # NOT a hard Qdrant filter — handled via embedding
+                    state=None,
+                    country=None
                 ),
                 companies=CompanyFilterV2(
                     worked_at=extracted.companies if hasattr(extracted, 'companies') else [],
@@ -1482,7 +1471,7 @@ async def smart_search_endpoint(request: SmartSearchQuery):
                 current_company=None
             ),
             options=SearchOptionsV2(
-                limit=min(limit * 5, 500),
+                limit=min(limit * 20, 1000) if location_preference == "must_match" else min(limit * 5, 500),
                 expand_skills=True
             )
         )
@@ -1503,49 +1492,46 @@ async def smart_search_endpoint(request: SmartSearchQuery):
     # 3. Execute search with parsed query
     response = await search_v2(parsed_result)
     
-    logger.info(f"Initial Qdrant results: {len(response.results)} candidates, scores: {[f'{r.score:.3f}' for r in response.results[:5]]}")
+    logger.info(f"Qdrant results: {len(response.results)} candidates, "
+               f"top scores: {[f'{r.score:.3f}' for r in response.results[:5]]}")
     
-    # Calculate facets from UNFILTERED results (before re-ranking and filtering)
+    # Calculate facets from results
     facets = calculate_location_facets(response.results)
     
-    # 4. SMART RE-RANKING: Apply boosts based on extracted filters
-    # This is what makes smart search SMART - matching skills/location/companies get boosted
+    # 4. LOCATION MODE HANDLING (no re-ranking — trust Qdrant)
     location_preference = request.location_preference if hasattr(request, 'location_preference') else "preferred"
-    reranked_results = smart_rerank(response.results, smart_filters, location_preference=location_preference)
+    results = response.results
     
-    logger.info(f"After reranking, top 5 scores: {[f'{r.score:.3f}' for r in reranked_results[:5]]}")
+    target_city = smart_filters.get("city")
+    target_state = smart_filters.get("state")
+    target_country = smart_filters.get("country")
+    target_location = (target_city or target_state or target_country or "").lower()
     
-    # 5. LOCATION FILTERING: Hard filter for "must_match" mode or selected locations
-    if location_preference == "must_match" and smart_filters.get("city"):
-        # MUST MATCH: Only show candidates from target location
-        target_city = smart_filters["city"].lower()
-        before_filter = len(reranked_results)
-        reranked_results = [
-            r for r in reranked_results
-            if target_city in (r.city or "").lower() or target_city in (r.location or "").lower()
+    if location_preference == "must_match" and target_location:
+        # MUST MATCH: Hard post-filter on DuckDB hydrated city/location
+        before = len(results)
+        results = [
+            r for r in results
+            if target_location in (r.city or "").lower()
+            or target_location in (getattr(r, 'location', '') or "").lower()
+            or target_location in (r.country or "").lower()
         ]
-        logger.info(f"MUST_MATCH filter: {before_filter} → {len(reranked_results)} (city: {target_city})")
-    elif hasattr(request, 'selected_locations') and request.selected_locations and location_preference != "remote":
-        before_filter = len(reranked_results)
-        reranked_results = filter_by_locations(reranked_results, request.selected_locations)
-        logger.info(f"Location filter: {before_filter} → {len(reranked_results)} (selected: {request.selected_locations})")
-    
-    # 6. QUALITY FILTER: Remove weak matches (minimum threshold)
-    # If user has specific filters, require higher quality
-    has_filters = bool(smart_filters["skills"] or smart_filters["city"] or smart_filters["state"])
-    min_score = 0.45 if has_filters else 0.35  # Lowered thresholds to be less aggressive
-    
-    quality_filtered = [
-        r for r in reranked_results 
-        if r.score >= min_score
-    ]
-    
-    logger.info(f"Results - Before filter: {len(reranked_results)}, After quality filter (>={min_score}): {len(quality_filtered)}")
+        logger.info(f"MUST_MATCH: {before} → {len(results)} (location: {target_location})")
+    elif location_preference == "remote":
+        # REMOTE: No location filtering at all — show everyone
+        logger.info(f"REMOTE mode: showing all {len(results)} results")
+    else:
+        # PREFERRED: Qdrant already ranked by embedding similarity (which includes location)
+        # Optional: filter by user-selected locations
+        if hasattr(request, 'selected_locations') and request.selected_locations:
+            before = len(results)
+            results = filter_by_locations(results, request.selected_locations)
+            logger.info(f"Selected locations filter: {before} → {len(results)}")
     
     # Limit to requested amount
-    final_results = quality_filtered[:limit]
+    final_results = results[:limit]
     
-    # Calculate city breakdown for filtering
+    # City breakdown
     from collections import Counter
     city_counts = Counter()
     for result in final_results:
@@ -1553,7 +1539,6 @@ async def smart_search_endpoint(request: SmartSearchQuery):
         if city:
             city_counts[city] += 1
     
-    # Sort by count descending
     from search_schema import CityCount
     city_breakdown = [
         CityCount(city=city, count=count)
@@ -1563,11 +1548,11 @@ async def smart_search_endpoint(request: SmartSearchQuery):
     total_time = int((time.time() - start_time) * 1000)
     
     return SmartSearchResponse(
-        total_matches=len(quality_filtered),
+        total_matches=len(results),
         returned=len(final_results),
         took_ms=total_time,
         city_breakdown=city_breakdown,
-        facets=facets,  # Add location facets
+        facets=facets,
         query_understanding={
             "original_query": request.query,
             "extracted_skills": smart_filters["skills"],
