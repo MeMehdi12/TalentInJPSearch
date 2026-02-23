@@ -28,7 +28,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 import duckdb
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
@@ -977,6 +977,21 @@ app.add_middleware(
 )
 
 
+# Add Cache-Control middleware to prevent browser caching of search results
+@app.middleware("http")
+async def add_cache_control_headers(request: Request, call_next):
+    """Prevent browser caching of search API responses"""
+    response = await call_next(request)
+    
+    # Add no-cache headers for search endpoints
+    if "/api/v2/search" in request.url.path or "/api/v2/smart-search" in request.url.path:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    
+    return response
+
+
 @app.get("/api/v2/health")
 async def health():
     """Health check endpoint"""
@@ -1396,7 +1411,7 @@ class SmartSearchResponse(BaseModel):
 
 
 @app.post("/api/v2/smart-search", response_model=SmartSearchResponse)
-async def smart_search_endpoint(request: SmartSearchQuery):
+async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request = None):
     """
     🧠 SMART SEARCH - Natural language talent search.
     
@@ -1420,13 +1435,25 @@ async def smart_search_endpoint(request: SmartSearchQuery):
     from query_preprocessor import smart_preprocess
     from openai_parser import parse_query_with_openai
     
+    # Extract request ID for correlation
+    request_id = http_request.headers.get("X-Request-ID", "unknown") if http_request else "unknown"
+    
     start_time = time.time()
     config = get_config()
     limit = min(request.limit, config.max_limit)
     location_preference = request.location_preference if hasattr(request, 'location_preference') else "preferred"
     
     # 1. Smart preprocessing with OpenAI
-    logger.info(f"Smart Search: '{request.query}' | Location Mode: {location_preference}")
+    logger.info("="*80)
+    logger.info(f"🔍 NEW SMART SEARCH REQUEST")
+    logger.info(f"   Request ID: {request_id}")
+    logger.info(f"   Query Text: '{request.query}'")
+    logger.info(f"   Query Length: {len(request.query)} chars")
+    logger.info(f"   Query Hash: {hash(request.query)}")
+    logger.info(f"   Limit: {request.limit}")
+    logger.info(f"   Location Mode: {location_preference}")
+    logger.info(f"   Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("="*80)
     
     # Try OpenAI first, fallback to regex preprocessor
     parsed_result, method, cost = parse_query_with_openai(request.query, fallback_to_regex=False)
@@ -1922,7 +1949,6 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
             temporary_emoji_status=result.temporary_emoji_status,
             background_picture=result.background_picture,
             area=result.area
-        ))
         ))
     
     # Sort by new score (highest first)
