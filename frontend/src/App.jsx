@@ -598,11 +598,11 @@ function App() {
   }
 
   return (
-    <Layout activePage={activePage} onNavigate={setActivePage} user={user}>
+    <Layout activePage={activePage} onNavigate={setActivePage} user={user} onLogout={handleLogout}>
       <div className="page-content">
         {activePage === 'dashboard' && (
           <>
-            <Header title="Dashboard" subtitle="Welcome back, Demo Admin" user={user} onLogout={handleLogout} />
+            <Header title="Dashboard" subtitle="Welcome back, Demo Admin" user={user} />
             <StatsCards stats={stats} />
             <DashboardCharts />
           </>
@@ -610,7 +610,7 @@ function App() {
 
         {activePage === 'search' && (
           <>
-            <Header title="Leads" subtitle="Find and qualify potential customers" user={user} onLogout={handleLogout} />
+            <Header title="Leads" subtitle="Find and qualify potential customers" user={user} />
             {renderSearchFilters()}
 
             <div className="results-area">
@@ -789,7 +789,7 @@ function App() {
 
         {activePage === 'campaigns' && (
           <>
-            <Header title="Campaigns" subtitle="Manage your outreach campaigns" user={user} onLogout={handleLogout} />
+            <Header title="Campaigns" subtitle="Manage your outreach campaigns" user={user} />
             <div className="empty-state">
               <h3>No active campaigns</h3>
               <p>Create a campaign to start reaching out to leads.</p>

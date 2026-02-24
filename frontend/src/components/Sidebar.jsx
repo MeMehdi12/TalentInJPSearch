@@ -14,7 +14,7 @@ const ChevronRight = ({ size = 20 }) => (
     </svg>
 );
 
-const Sidebar = ({ activePage, onNavigate, collapsed, onToggle, user }) => {
+const Sidebar = ({ activePage, onNavigate, collapsed, onToggle, user, onLogout }) => {
     // Derive display name + initials from email (e.g. john.doe@talentin.ai → "John Doe")
     const localPart = user ? user.split('@')[0] : 'user';
     const displayName = localPart
@@ -59,16 +59,51 @@ const Sidebar = ({ activePage, onNavigate, collapsed, onToggle, user }) => {
 
             <div className="sidebar-footer">
                 {!collapsed ? (
-                    <div className="user-profile-mini">
-                        <div className="avatar-mini">{initials}</div>
-                        <div className="user-info-mini">
-                            <div className="user-name" title={user}>{displayName}</div>
-                            <div className="user-role">{domain}</div>
+                    <div style={{ width: '100%' }}>
+                        <div className="user-profile-mini">
+                            <div className="avatar-mini">{initials}</div>
+                            <div className="user-info-mini">
+                                <div className="user-name" title={user}>{displayName}</div>
+                                <div className="user-role">{domain}</div>
+                            </div>
                         </div>
+                        <button
+                            onClick={onLogout}
+                            style={{
+                                marginTop: '0.6rem',
+                                width: '100%',
+                                background: 'rgba(255,255,255,0.05)',
+                                border: '1px solid rgba(255,255,255,0.1)',
+                                borderRadius: '0.5rem',
+                                padding: '0.45rem',
+                                fontSize: '0.78rem',
+                                fontWeight: '600',
+                                color: '#9ca3af',
+                                cursor: 'pointer',
+                                letterSpacing: '0.02em',
+                            }}
+                        >
+                            Sign out
+                        </button>
                     </div>
                 ) : (
-                    <div className="user-profile-mini" style={{ justifyContent: 'center' }}>
+                    <div className="user-profile-mini" style={{ justifyContent: 'center', flexDirection: 'column', gap: '0.5rem' }}>
                         <div className="avatar-mini" style={{ width: 32, height: 32, fontSize: '0.75rem' }} title={user}>{initials}</div>
+                        <button
+                            onClick={onLogout}
+                            title="Sign out"
+                            style={{
+                                background: 'rgba(255,255,255,0.05)',
+                                border: '1px solid rgba(255,255,255,0.1)',
+                                borderRadius: '0.4rem',
+                                padding: '0.3rem 0.4rem',
+                                cursor: 'pointer',
+                                color: '#9ca3af',
+                                fontSize: '0.7rem',
+                            }}
+                        >
+                            ⏻
+                        </button>
                     </div>
                 )}
             </div>
