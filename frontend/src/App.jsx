@@ -3,6 +3,8 @@ import './App.css';
 import { getStats, search, smartSearch, getCountries, getCities, getIndustries, getLocations, getSkills, getCertifications, getSchools, getRoles, exportExcel } from './api';
 import Layout from './components/Layout';
 import Header from './components/Header';
+import LoginPage from './components/LoginPage';
+import { getLoggedInUser, logout } from './auth';
 import StatsCards from './components/StatsCards';
 import CandidateCard from './components/CandidateCard';
 import SmartSearchBar from './components/SmartSearchBar';
@@ -10,6 +12,7 @@ import { IconSearch, IconFilter, IconX, IconDownload, IconLoader, IconMapPin, Ic
 import { DashboardCharts } from './components/Charts';
 
 function App() {
+  const [user, setUser] = useState(() => getLoggedInUser());
   const [activePage, setActivePage] = useState('dashboard');
   const [stats, setStats] = useState(null);
   const [results, setResults] = useState(null);
@@ -585,12 +588,21 @@ function App() {
     </div >
   );
 
+  const handleLogout = () => {
+    logout();
+    setUser(null);
+  };
+
+  if (!user) {
+    return <LoginPage onLogin={(email) => setUser(email)} />;
+  }
+
   return (
     <Layout activePage={activePage} onNavigate={setActivePage}>
       <div className="page-content">
         {activePage === 'dashboard' && (
           <>
-            <Header title="Dashboard" subtitle="Welcome back, Demo Admin" />
+            <Header title="Dashboard" subtitle="Welcome back, Demo Admin" user={user} onLogout={handleLogout} />
             <StatsCards stats={stats} />
             <DashboardCharts />
           </>
@@ -598,7 +610,7 @@ function App() {
 
         {activePage === 'search' && (
           <>
-            <Header title="Leads" subtitle="Find and qualify potential customers" />
+            <Header title="Leads" subtitle="Find and qualify potential customers" user={user} onLogout={handleLogout} />
             {renderSearchFilters()}
 
             <div className="results-area">
@@ -777,7 +789,7 @@ function App() {
 
         {activePage === 'campaigns' && (
           <>
-            <Header title="Campaigns" subtitle="Manage your outreach campaigns" />
+            <Header title="Campaigns" subtitle="Manage your outreach campaigns" user={user} onLogout={handleLogout} />
             <div className="empty-state">
               <h3>No active campaigns</h3>
               <p>Create a campaign to start reaching out to leads.</p>

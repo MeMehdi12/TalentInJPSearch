@@ -23,8 +23,8 @@ from pathlib import Path
 # Load environment variables from .env file
 from dotenv import load_dotenv
 
-# Load .env from project root
-env_path = Path(__file__).parent.parent / ".env"
+# Load .env from backend directory (where the .env file actually lives)
+env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 from openai import OpenAI, APIError, APITimeoutError, RateLimitError
@@ -70,7 +70,7 @@ class OpenAIConfig:
         # Validate model
         valid_models = [
             "gpt-5.2", "gpt-5.2-mini", "gpt-5.2-nano",  # GPT-5.2 family
-            "gpt-5-mini",  # GPT-5 mini
+            "gpt-5-mini", "gpt-5-mini-2025-08-07",  # GPT-5 mini
             "gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"  # Legacy
         ]
         if self.model not in valid_models:
@@ -231,6 +231,7 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
         "gpt-5.2": {"input": 2.00, "output": 8.00},
         # GPT-5 family
         "gpt-5-mini": {"input": 0.20, "output": 0.80},
+        "gpt-5-mini-2025-08-07": {"input": 0.20, "output": 0.80},
         # Legacy models
         "gpt-4o-mini": {"input": 0.150, "output": 0.600},
         "gpt-4o": {"input": 2.50, "output": 10.00},

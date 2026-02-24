@@ -91,18 +91,29 @@ SKILL_CATEGORIES = {
 # =============================================================================
 
 TITLE_PATTERNS = {
-    # Engineer variations
-    "software engineer": ["software engineer", "swe", "software dev", "software developer", "sw engineer", "programmer"],
-    "backend engineer": ["backend engineer", "backend developer", "back end", "backend dev", "server side", "backend"],
-    "frontend engineer": ["frontend engineer", "frontend developer", "front end", "frontend dev", "ui developer", "ui engineer", "frontend"],
-    "fullstack engineer": ["fullstack", "full stack", "full-stack", "fullstack engineer", "fullstack developer"],
-    "devops engineer": ["devops", "devops engineer", "sre", "site reliability", "platform engineer", "infra engineer"],
-    "data engineer": ["data engineer", "data engineering", "de", "etl engineer", "data pipeline"],
-    "data scientist": ["data scientist", "data science", "ds", "ml engineer", "machine learning engineer"],
-    "ml engineer": ["ml engineer", "machine learning engineer", "ai engineer", "deep learning engineer", "ml eng"],
-    "mobile engineer": ["mobile engineer", "mobile developer", "ios developer", "android developer", "app developer"],
-    "qa engineer": ["qa", "qa engineer", "qe", "test engineer", "sdet", "quality assurance"],
-    "security engineer": ["security engineer", "infosec", "cybersecurity", "security analyst", "penetration tester"],
+    # Generic Engineer/Developer (MUST be first to catch broad searches)
+    "software engineer": ["software engineer", "swe", "software dev", "software developer", "sw engineer", "programmer", "engineer", "developer", "coder"],
+    
+    # AI/ML specific
+    "ai engineer": ["ai engineer", "ai developer", "artificial intelligence engineer", "artificial intelligence developer", "ai specialist", "ai ml engineer"],
+    "ml engineer": ["ml engineer", "machine learning engineer", "machine learning developer", "ml developer", "deep learning engineer", "ml eng"],
+    "data scientist": ["data scientist", "data science", "ds", "applied scientist", "research scientist", "ai researcher"],
+    
+    # Backend/Frontend/Full-stack
+    "backend engineer": ["backend engineer", "backend developer", "back end", "backend dev", "server side", "backend", "backend software engineer"],
+    "frontend engineer": ["frontend engineer", "frontend developer", "front end", "frontend dev", "ui developer", "ui engineer", "frontend", "frontend software engineer"],
+    "fullstack engineer": ["fullstack", "full stack", "full-stack", "fullstack engineer", "fullstack developer", "full stack developer"],
+    
+    # Infrastructure & DevOps
+    "devops engineer": ["devops", "devops engineer", "sre", "site reliability", "platform engineer", "infra engineer", "infrastructure engineer"],
+    "data engineer": ["data engineer", "data engineering", "de", "etl engineer", "data pipeline", "data platform engineer"],
+    
+    # Mobile & QA
+    "mobile engineer": ["mobile engineer", "mobile developer", "mobile dev", "ios developer", "android developer", "app developer", "mobile software engineer"],
+    "qa engineer": ["qa", "qa engineer", "qe", "test engineer", "sdet", "quality assurance", "software test engineer"],
+    
+    # Security
+    "security engineer": ["security engineer", "infosec", "cybersecurity", "security analyst", "penetration tester", "infosec engineer"],
     
     # Manager/Lead variations  
     "engineering manager": ["engineering manager", "em", "eng manager", "engineering lead"],
@@ -260,6 +271,7 @@ class ExtractedQuery:
     companies: List[str] = field(default_factory=list)
     expanded_companies: List[str] = field(default_factory=list)  # After alias expansion
     titles: List[str] = field(default_factory=list)
+    certifications: List[str] = field(default_factory=list)  # Professional certifications
     
     # Location
     city: Optional[str] = None
@@ -347,6 +359,7 @@ class SmartQueryPreprocessor:
         result.skills = self._extract_skills(query_expanded)
         result.companies = self._extract_companies(query_expanded)
         result.titles = self._extract_titles(query_expanded)
+        result.certifications = self._extract_certifications(query_expanded)
         
         # 5. Extract location (only if explicitly mentioned)
         city, state, country = self._extract_location(query_expanded)
@@ -538,6 +551,33 @@ class SmartQueryPreprocessor:
                     break
         
         return list(found_titles)
+    
+    def _extract_certifications(self, text: str) -> List[str]:
+        """Extract professional certifications from text"""
+        found_certs = set()
+        text_lower = text.lower()
+        
+        # Define certification patterns with their canonical names
+        cert_patterns = {
+            "CPA": [r'\b(cpa|uscpa|us cpa|u\.s\. cpa|certified public accountant)\b'],
+            "AWS Certified Solutions Architect": [r'\b(aws certified|aws cert|aws solutions architect)\b'],
+            "AWS Certified Developer": [r'\b(aws developer|aws dev cert)\b'],
+            "PMP": [r'\b(pmp|project management professional)\b'],
+            "CFA": [r'\b(cfa|chartered financial analyst)\b'],
+            "CISSP": [r'\b(cissp|certified information systems security professional)\b'],
+            "Six Sigma": [r'\b(six sigma|6 sigma|six ?sigma (green|black) belt)\b'],
+            "CMA": [r'\b(cma|certified management accountant)\b'],
+            "CIA": [r'\b(cia|certified internal auditor)\b'],
+            "CFP": [r'\b(cfp|certified financial planner)\b'],
+        }
+        
+        for cert_name, patterns in cert_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, text_lower):
+                    found_certs.add(cert_name)
+                    break
+        
+        return list(found_certs)
     
     def _extract_location(self, text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """Extract location from text - precise word boundary matching"""

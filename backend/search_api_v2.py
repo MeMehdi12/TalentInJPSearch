@@ -280,12 +280,9 @@ def build_qdrant_filter(query: ParsedQueryV2) -> Optional[Filter]:
             FieldCondition(key="current_company", match=MatchAny(any=with_case_variations([company_normalized])))
         )
     
-    # Domain
-    if filters.domain:
-        domain_val = normalize_text(filters.domain)
-        must_conditions.append(
-            FieldCondition(key="domain", match=MatchAny(any=with_case_variations([domain_val])))
-        )
+    # Domain: NOT used as a hard Qdrant filter — domain data is sparse/inconsistently
+    # tagged on profiles. Instead, domain is added to search_text for semantic matching.
+    # (see smart_search_endpoint where domain is appended to enriched search text)
     
     # Experience range
     if filters.experience.min_years is not None:
@@ -316,7 +313,7 @@ def get_sparse_encoder():
         from collections import Counter
         
         base_dir = Path(__file__).parent.parent
-        cache_dir = base_dir / "Database" / "sparse_cache"
+        cache_dir = base_dir / "database" / "sparse_cache"
         
         class QueryEncoder:
             TOKEN_PATTERN = re.compile(r'[a-zA-Z0-9]+|[\u3040-\u309F]+|[\u30A0-\u30FF]+|[\u4E00-\u9FFF]+')
@@ -339,7 +336,7 @@ def get_sparse_encoder():
                         self.avg_doc_len = stats.get('avg_doc_len', 50.0)
                     logger.info(f"Loaded sparse encoder: {len(self.vocabulary)} tokens")
                 except Exception as e:
-                    logger.warning(f"Could not load sparse encoder: {e}")
+                    logger.debug(f"Sparse encoder not available (dense-only mode): {e}")
             
             def encode(self, text: str):
                 if not text or not self.vocabulary:
@@ -798,6 +795,7 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
     t0 = time.time()
     results = []
     exclude_skills = set(s.lower() for s in query.filters.skills.exclude)
+    target_certifications = set(c.lower() for c in query.filters.certifications)
     
     # Additional strict filters setup
     target_first = (query.filters.first_name or "").lower()
@@ -812,6 +810,43 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
         profile_skills = set(s.lower() for s in (profile.get('skills') or []))
         if exclude_skills & profile_skills:
             continue  # Skip profiles with excluded skills
+        
+        # Filter by certifications if specified (soft match across all text fields)
+        if target_certifications:
+            # Build a blob of all text from this profile to search in
+            cert_text_parts = []
+            cert_text_parts += [c.lower() for c in (profile.get('certifications') or [])]
+            cert_text_parts.append((profile.get('headline') or '').lower())
+            cert_text_parts.append((profile.get('description') or '').lower())
+            cert_text_parts.append((profile.get('job_title') or '').lower())
+            cert_text_parts.append((profile.get('search_name') or '').lower())
+            for wh in (profile.get('work_history') or []):
+                cert_text_parts.append((wh.get('title') or '').lower())
+                cert_text_parts.append((wh.get('description') or '').lower())
+            cert_blob = ' '.join(cert_text_parts)
+
+            # Cert keyword aliases — any token match counts
+            cert_aliases = {
+                'cpa': ['cpa', 'certified public accountant', 'uscpa', 'us cpa'],
+                'uscpa': ['uscpa', 'us cpa', 'cpa', 'certified public accountant'],
+                'pmp': ['pmp', 'project management professional'],
+                'cfa': ['cfa', 'chartered financial analyst'],
+                'cissp': ['cissp'],
+                'six sigma': ['six sigma', '6 sigma'],
+                'aws certified': ['aws certified', 'aws solutions architect', 'aws developer'],
+            }
+
+            has_cert_match = False
+            for target_cert in target_certifications:
+                aliases = cert_aliases.get(target_cert, [target_cert])
+                for alias in aliases:
+                    if alias in cert_blob:
+                        has_cert_match = True
+                        break
+                if has_cert_match:
+                    break
+            if not has_cert_match:
+                continue  # Skip profiles without any cert match
             
         # STRICT NAME FILTERING (Moved inside loop)
         full_name = (profile.get('full_name') or "").lower()
@@ -1516,11 +1551,19 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
         else:
             parsed_result.options.limit = min(limit * 5, 500)
         
-        # Enrich search_text with titles + location for semantic matching
+        # Enrich search_text with titles + location + domain for semantic matching
         # (these are NOT hard Qdrant filters — they rely on embedding similarity)
         enriched = parsed_result.search_text or request.query
         if parsed_result.filters.job_titles:
             enriched += " " + " ".join(parsed_result.filters.job_titles)
+        if parsed_result.filters.domain:
+            # Add domain keywords to semantic search instead of using as hard filter
+            domain_keywords = parsed_result.filters.domain.replace("_", " ")
+            enriched += " " + domain_keywords
+            parsed_result.filters.domain = None  # Clear so it doesn't hit Qdrant filter
+        if parsed_result.filters.certifications:
+            # Add cert keywords to semantic text too
+            enriched += " " + " ".join(parsed_result.filters.certifications)
         if parsed_result.filters.location.city:
             enriched += " " + parsed_result.filters.location.city
         if parsed_result.filters.location.state:
@@ -1898,23 +1941,36 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         
         # ── 5. CERTIFICATION MATCH ────────────────────────────────────
         matched_certs = []
-        if target_certifications and result.certifications:
-            profile_certs = set(c.lower() for c in result.certifications)
-            # Exact matches
-            exact_cert_matches = target_certifications & profile_certs
-            matched_certs.extend(exact_cert_matches)
-            
-            # Partial matches (e.g., "AWS" matches "AWS Certified Solutions Architect")
-            if not exact_cert_matches:
-                for target_cert in target_certifications:
-                    for profile_cert in result.certifications:
-                        if target_cert in profile_cert.lower():
-                            matched_certs.append(profile_cert)
-                            break
-            
+        if target_certifications:
+            cert_aliases = {
+                'cpa': ['cpa', 'certified public accountant', 'uscpa', 'us cpa'],
+                'uscpa': ['uscpa', 'us cpa', 'cpa', 'certified public accountant'],
+                'pmp': ['pmp', 'project management professional'],
+                'cfa': ['cfa', 'chartered financial analyst'],
+                'cissp': ['cissp'],
+                'six sigma': ['six sigma', '6 sigma'],
+                'aws certified': ['aws certified', 'aws solutions architect', 'aws developer'],
+            }
+            # Build full-text blob from all profile text fields
+            cert_text_parts = [c.lower() for c in (result.certifications or [])]
+            cert_text_parts.append((result.headline or '').lower())
+            cert_text_parts.append((result.job_title or '').lower())
+            cert_text_parts.append((getattr(result, 'description', '') or '').lower())
+            for wh in (getattr(result, 'work_history', None) or []):
+                cert_text_parts.append((wh.get('title') or '').lower())
+                cert_text_parts.append((wh.get('description') or '').lower())
+            cert_blob = ' '.join(cert_text_parts)
+
+            for target_cert in target_certifications:
+                aliases = cert_aliases.get(target_cert, [target_cert])
+                for alias in aliases:
+                    if alias in cert_blob:
+                        matched_certs.append(target_cert)
+                        break
+
             if matched_certs:
-                cert_coverage = len(matched_certs) / len(target_certifications)
-                cert_bonus = cert_coverage * 0.20  # Up to +0.20 for all certs matched
+                cert_coverage = len(set(matched_certs)) / len(target_certifications)
+                cert_bonus = cert_coverage * 0.50  # Up to +0.50 for all certs matched
                 bonus += cert_bonus
                 bonus_details.append(f"certs+{cert_bonus:.2f}")
         

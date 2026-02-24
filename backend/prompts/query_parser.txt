@@ -27,6 +27,17 @@ Your task is to convert natural language queries into structured JSON filters fo
 - List of keywords to match in job titles (e.g., ["senior", "staff", "lead"])
 - This is a soft filter (boosts ranking)
 
+### Certifications
+- List of professional certifications to match (e.g., ["CPA", "AWS Certified", "PMP"])
+- Common abbreviations:
+  - "USCPA" / "CPA" → U.S. Certified Public Accountant
+  - "AWS" → AWS Certified Solutions Architect / AWS Certified Developer
+  - "PMP" → Project Management Professional
+  - "CFA" → Chartered Financial Analyst
+  - "CISSP" → Certified Information Systems Security Professional
+  - "Six Sigma" → Six Sigma Green Belt / Black Belt
+- This is a powerful filter - use when explicitly mentioned
+
 ### Domain
 - Industry/domain (e.g., "technology_software", "data_science_ai", "finance_accounting")
 
@@ -62,6 +73,7 @@ Return ONLY valid JSON in this exact structure:
       "exclude": ["company3"]
     },
     "job_titles": ["senior", "staff"],
+    "certifications": ["CPA", "AWS Certified"],
     "domain": "technology_software"
   },
   "options": {
@@ -149,6 +161,82 @@ Output:
     "experience": {"min_years": 5, "max_years": null},
     "companies": {"worked_at": [], "current_only": false, "exclude": []},
     "job_titles": ["backend", "engineer"],
+    "domain": "technology_software"
+  },
+  "options": {"limit": 50, "expand_skills": true}
+}
+```
+
+### Example 4: Certification Query
+Input: "USCPA with 5+ years experience"
+Output:
+```json
+{
+  "search_text": "certified public accountant accounting finance",
+  "filters": {
+    "skills": {"must_have": ["accounting"], "nice_to_have": ["taxation", "financial reporting", "audit"], "exclude": []},
+    "location": {"city": null, "state": null, "country": null},
+    "experience": {"min_years": 5, "max_years": null},
+    "companies": {"worked_at": [], "current_only": false, "exclude": []},
+    "job_titles": [],
+    "certifications": ["CPA", "USCPA"],
+    "domain": "finance_accounting"
+  },
+  "options": {"limit": 50, "expand_skills": true}
+}
+```
+
+### Example 5: AWS Certified Developer
+Input: "AWS certified developer with terraform experience"
+Output:
+```json
+{
+  "search_text": "aws cloud developer infrastructure",
+  "filters": {
+    "skills": {"must_have": ["aws", "terraform"], "nice_to_have": ["docker", "kubernetes", "cloudformation"], "exclude": []},
+    "location": {"city": null, "state": null, "country": null},
+    "experience": {"min_years": null, "max_years": null},
+    "companies": {"worked_at": [], "current_only": false, "exclude": []},
+    "job_titles": ["developer"],
+    "certifications": ["AWS Certified Solutions Architect", "AWS Certified Developer"],
+    "domain": "technology_software"
+  },
+  "options": {"limit": 50, "expand_skills": true}
+}
+```
+
+### Example 6: AI Developer
+Input: "AI Developer in San Francisco"
+Output:
+```json
+{
+  "search_text": "ai developer artificial intelligence machine learning engineer",
+  "filters": {
+    "skills": {"must_have": ["artificial intelligence", "machine learning"], "nice_to_have": ["python", "tensorflow", "pytorch", "llm", "nlp"], "exclude": []},
+    "location": {"city": "San Francisco", "state": "California", "country": "United States"},
+    "experience": {"min_years": null, "max_years": null},
+    "companies": {"worked_at": [], "current_only": false, "exclude": []},
+    "job_titles": ["ai", "developer", "engineer", "ai engineer", "ai developer"],
+    "certifications": [],
+    "domain": "data_science_ai"
+  },
+  "options": {"limit": 50, "expand_skills": true}
+}
+```
+
+### Example 7: Generic Developer Search
+Input: "software developer with 3 years experience"
+Output:
+```json
+{
+  "search_text": "software developer engineer programmer",
+  "filters": {
+    "skills": {"must_have": [], "nice_to_have": ["python", "javascript", "java", "react", "aws"], "exclude": []},
+    "location": {"city": null, "state": null, "country": null},
+    "experience": {"min_years": 3, "max_years": null},
+    "companies": {"worked_at": [], "current_only": false, "exclude": []},
+    "job_titles": ["software", "developer", "engineer"],
+    "certifications": [],
     "domain": "technology_software"
   },
   "options": {"limit": 50, "expand_skills": true}

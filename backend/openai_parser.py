@@ -200,6 +200,7 @@ def _json_to_parsed_query(data: dict) -> ParsedQueryV2:
     # Job titles and domain
     job_titles = filters_data.get("job_titles", [])
     domain = filters_data.get("domain")
+    certifications = filters_data.get("certifications", [])
     
     # Options
     options_data = data.get("options", {})
@@ -215,6 +216,7 @@ def _json_to_parsed_query(data: dict) -> ParsedQueryV2:
         experience=experience,
         companies=companies,
         job_titles=job_titles,
+        certifications=certifications,
         domain=domain
     )
     
@@ -316,6 +318,21 @@ def _fallback_regex_parser(query: str) -> Optional[ParsedQueryV2]:
     if "faang" in query_lower:
         companies = ["facebook", "apple", "amazon", "netflix", "google"]
     
+    # Extract certifications
+    certifications = []
+    certification_patterns = {
+        "CPA": r'\b(cpa|uscpa|us cpa|certified public accountant)\b',
+        "AWS Certified": r'\b(aws certified|aws cert)\b',
+        "PMP": r'\b(pmp|project management professional)\b',
+        "CFA": r'\b(cfa|chartered financial analyst)\b',
+        "CISSP": r'\b(cissp|certified information systems security professional)\b',
+        "Six Sigma": r'\b(six sigma|6 sigma)\b',
+    }
+    
+    for cert_name, pattern in certification_patterns.items():
+        if re.search(pattern, query_lower):
+            certifications.append(cert_name)
+    
     # Build filters
     filters = FiltersV2(
         skills=SkillFiltersV2(must_have=skills, nice_to_have=[], exclude=[]),
@@ -323,6 +340,7 @@ def _fallback_regex_parser(query: str) -> Optional[ParsedQueryV2]:
         experience=ExperienceFilterV2(min_years=min_years, max_years=max_years),
         companies=CompanyFilterV2(worked_at=companies, current_only=False, exclude=[]),
         job_titles=[],
+        certifications=certifications,
         domain=None
     )
     

@@ -1,0 +1,60 @@
+TALENTIN AI TALENT SEARCH — SYSTEM OVERVIEW
+============================================
+
+ARCHITECTURE
+------------
+- Frontend : React (Vite) — SmartSearchBar → REST API calls
+- Backend  : FastAPI (Python) on EC2, served via Nginx reverse proxy
+- Vector DB: Qdrant Cloud — 235,000+ candidate profiles as dense + sparse vectors
+- SQL DB   : DuckDB — full profile data (skills, roles, education, certifications)
+- AI Parser: OpenAI gpt-5-mini-2025-08-07 — converts natural language to structured filters
+
+SEARCH FLOW
+-----------
+1. User types a natural language query (e.g. "USCPA with 5+ years experience")
+2. OpenAI parser extracts: skills, certifications, location, experience range, job titles, domain
+3. Domain and certifications are appended to the semantic search_text (NOT hard filters)
+4. Qdrant hybrid search (dense embedding + BM25 sparse) returns top candidate IDs
+   - Hard Qdrant filters: must_have skills, worked_at companies, experience range only
+5. Candidate profiles are hydrated from DuckDB (work history, education, certifications)
+6. Smart re-ranking applies score bonuses for: skill match, cert match (headline/title/
+   work history text), location match, experience proximity, title match, company match
+7. Final results returned with query_understanding metadata
+
+KEY FILES
+---------
+backend/search_api_v2.py    — Main FastAPI app, all endpoints, search logic, re-ranking
+backend/openai_parser.py    — OpenAI query parsing, fallback regex parser
+backend/openai_config.py    — OpenAI client setup, retry logic, cost tracking
+backend/search_schema.py    — Pydantic models (ParsedQueryV2, FiltersV2, CandidateResultV2)
+backend/normalizers.py      — Skill/company/location alias expansion and normalization
+backend/prompts/query_parser.txt — System prompt for OpenAI query parsing
+backend/.env                — Local environment variables (not committed)
+backend/.env.production     — Production environment variables (deployed to server)
+deployment/                 — systemd service + Nginx config files
+
+ENDPOINTS
+---------
+POST /api/v2/smart-search   — Natural language search (uses OpenAI parser)
+POST /api/v2/search         — Structured search (direct filter input)
+GET  /api/v2/health         — Health check (Qdrant + DuckDB connectivity)
+GET  /api/v2/stats          — Database statistics (profile counts, etc.)
+
+DEPLOYMENT
+----------
+Server  : ubuntu@ec2-3-12-221-73.us-east-2.compute.amazonaws.com
+Service : /etc/systemd/system/talentin-backend.service (auto-restart)
+Backend : /var/www/talentin/backend/
+Logs    : /var/log/talentin/backend.log  (stdout)
+          /var/log/talentin/backend-error.log  (stderr)
+Restart : sudo systemctl restart talentin-backend.service
+
+IMPORTANT DESIGN NOTES
+-----------------------
+- domain is NOT a hard Qdrant filter — too few profiles are tagged; it feeds search_text instead
+- location is NOT a hard Qdrant filter — location data is inconsistent; handled via embedding
+  similarity (preferred mode) or post-filter on DuckDB hydrated city field (must_match mode)
+- certifications are matched against headline, job title, and work history text — not
+  only the certifications table, since most profiles store CPA/licenses in their title/bio
+- skills from OpenAI nice_to_have go into the Qdrant must filter only if must_have is empty
+  (capped at 3 to avoid over-restriction)
