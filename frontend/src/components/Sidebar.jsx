@@ -14,7 +14,19 @@ const ChevronRight = ({ size = 20 }) => (
     </svg>
 );
 
-const Sidebar = ({ activePage, onNavigate, collapsed, onToggle }) => {
+const Sidebar = ({ activePage, onNavigate, collapsed, onToggle, user }) => {
+    // Derive display name + initials from email (e.g. john.doe@talentin.ai → "John Doe")
+    const localPart = user ? user.split('@')[0] : 'user';
+    const displayName = localPart
+        .replace(/[._-]/g, ' ')
+        .replace(/\b\w/g, (c) => c.toUpperCase());
+    const domain = user ? user.split('@')[1] : '';
+    const initials = displayName
+        .split(' ')
+        .map((w) => w[0])
+        .join('')
+        .slice(0, 2)
+        .toUpperCase();
     const menuItems = [
         { id: 'dashboard', label: 'Dashboard', icon: IconDashboard },
         { id: 'search', label: 'Leads', icon: IconUsers },
@@ -48,15 +60,15 @@ const Sidebar = ({ activePage, onNavigate, collapsed, onToggle }) => {
             <div className="sidebar-footer">
                 {!collapsed ? (
                     <div className="user-profile-mini">
-                        <div className="avatar-mini">DA</div>
+                        <div className="avatar-mini">{initials}</div>
                         <div className="user-info-mini">
-                            <div className="user-name">Demo Admin</div>
-                            <div className="user-role">Admin</div>
+                            <div className="user-name" title={user}>{displayName}</div>
+                            <div className="user-role">{domain}</div>
                         </div>
                     </div>
                 ) : (
                     <div className="user-profile-mini" style={{ justifyContent: 'center' }}>
-                        <div className="avatar-mini" style={{ width: 32, height: 32, fontSize: '0.75rem' }}>DA</div>
+                        <div className="avatar-mini" style={{ width: 32, height: 32, fontSize: '0.75rem' }} title={user}>{initials}</div>
                     </div>
                 )}
             </div>

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import Sidebar from './Sidebar';
 
-const Layout = ({ children, activePage, onNavigate }) => {
+const Layout = ({ children, activePage, onNavigate, user }) => {
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
     return (
@@ -11,6 +11,7 @@ const Layout = ({ children, activePage, onNavigate }) => {
                 onNavigate={onNavigate}
                 collapsed={sidebarCollapsed}
                 onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
+                user={user}
             />
             <main className="main-content">
                 {children}

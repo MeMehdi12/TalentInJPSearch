@@ -598,7 +598,7 @@ function App() {
   }
 
   return (
-    <Layout activePage={activePage} onNavigate={setActivePage}>
+    <Layout activePage={activePage} onNavigate={setActivePage} user={user}>
       <div className="page-content">
         {activePage === 'dashboard' && (
           <>
