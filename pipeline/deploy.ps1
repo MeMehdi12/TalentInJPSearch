@@ -82,8 +82,15 @@ $backendFiles = @(
     "backend\search_schema.py",
     "backend\search_service.py",
     "backend\sparse_encoder.py",
-    "backend\text_parser.py"
+    "backend\text_parser.py",
+    "backend\mappings\company_aliases.json",
+    "backend\mappings\school_aliases.json",
+    "backend\prompts\jd_parser.txt",
+    "backend\prompts\query_parser.txt"
 )
+# Ensure remote subdirectories exist
+ssh -i $KEY_PATH -o StrictHostKeyChecking=no $SERVER "mkdir -p /var/www/talentin/backend/mappings /var/www/talentin/backend/prompts"
+
 foreach ($f in $backendFiles) {
     $local  = Join-Path $ROOT $f
     $remote = "/var/www/talentin/$($f -replace '\\', '/')"

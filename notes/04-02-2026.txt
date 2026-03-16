@@ -1,0 +1,13 @@
+Once the Loxo Qdrant upsert finishes, the remaining steps are all deployment:
+
+Upload DuckDB to VPS — the updated local DB (now with Loxo's 17,388 rows) needs to be SCP'd up
+Push backend code changes — config.py, client_auth.py, search_api_v2.py (multi-tenant changes)
+Update VPS .env — append DEFAULT_CLIENT_ID=00
+Update frontend .env — add @loxo.co → "01" to VITE_CLIENT_MAP, then npm run build
+Push frontend dist/ to VPS
+Restart backend service — sudo systemctl restart talentin-backend
+Steps 2–6 are fast. Step 1 (672MB DuckDB upload) will take the longest depending on your connection.
+
+Want me to prep a single PowerShell script that does all of this in sequence so you can just run it when the ingest finishes?
+
+Claude Sonnet 4.6  Pending tasks
