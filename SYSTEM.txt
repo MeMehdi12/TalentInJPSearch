@@ -42,7 +42,7 @@ GET  /api/v2/stats          — Database statistics (profile counts, etc.)
 
 DEPLOYMENT
 ----------
-Server  : ubuntu@ec2-3-12-221-73.us-east-2.compute.amazonaws.com
+Server  : (see deploy.ps1 — SSH details not stored in docs)
 Service : /etc/systemd/system/talentin-backend.service (auto-restart)
 Backend : /var/www/talentin/backend/
 Logs    : /var/log/talentin/backend.log  (stdout)

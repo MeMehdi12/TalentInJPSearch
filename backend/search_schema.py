@@ -392,6 +392,7 @@ class CandidateResultV2(BaseModel):
     current_company: Optional[str] = None
     location: str = Field("", description="Formatted location string")
     city: Optional[str] = None
+    state: Optional[str] = None
     country: Optional[str] = None
     photo: Optional[str] = None
     headline: Optional[str] = None
@@ -421,9 +422,6 @@ class CandidateResultV2(BaseModel):
     
     # Education
     education: List[Dict[str, Any]] = Field(default_factory=list, description="Educational background")
-    
-    # URLs
-    linkedin_url: Optional[str] = None
     
     # Extended Person Data
     address: Optional[str] = None

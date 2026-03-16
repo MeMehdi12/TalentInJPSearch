@@ -1,0 +1,12 @@
+# Prevent AI agents (Copilot, etc.) from reading sensitive files
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+.env.local
+.env.production
+backend/.env
+backend/.env.production
+credentials.json

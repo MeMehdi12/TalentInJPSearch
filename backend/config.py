@@ -28,6 +28,18 @@ class Config:
     qdrant_url: str
     duckdb_path: str
     
+    # === MULTI-TENANT CLIENT ISOLATION ===
+    # JWT secret used to validate Bearer tokens from external platforms.
+    # The JWT payload must include a "client_id" claim.
+    jwt_secret: Optional[str] = None
+    jwt_algorithm: str = "HS256"
+    # Fallback client_id when no JWT or X-Client-ID header is present.
+    # Map this to your existing (Talentin) dataset.
+    default_client_id: str = "00"
+    # JSON mapping of API-Key → client_id, e.g.:
+    # '{"my-api-key-abc": "talentin", "client2-key-xyz": "acme"}'
+    api_key_client_map_json: str = "{}"
+    
     # === QDRANT ===
     qdrant_api_key: Optional[str] = None
     qdrant_collection: str = "profiles_hybrid"  # Hybrid collection (dense + sparse)
@@ -62,8 +74,8 @@ class Config:
     bonus_profile_completeness: float = 0.03  # Profile quality (was 0.02)
     
     # === SKILL EXPANSION ===
-    skill_expansion_min_similarity: float = 0.7  # Min similarity for skill expansion
-    skill_expansion_max_related: int = 5         # Max related skills to expand
+    skill_expansion_min_similarity: float = 0.55  # Min similarity for skill expansion (lower = broader recall)
+    skill_expansion_max_related: int = 5          # Max related skills to expand
     
     @property
     def is_cloud(self) -> bool:
@@ -77,6 +89,12 @@ class Config:
         env = os.getenv("SEARCH_ENV", "local").lower()
         base_dir = Path(__file__).parent.parent
         
+        # Multi-tenant settings (common to both envs)
+        jwt_secret = os.getenv("JWT_SECRET")
+        jwt_algorithm = os.getenv("JWT_ALGORITHM", "HS256")
+        default_client_id = os.getenv("DEFAULT_CLIENT_ID", "00")
+        api_key_client_map_json = os.getenv("API_KEY_CLIENT_MAP", "{}")
+
         if env == "local":
             return cls(
                 qdrant_url=os.getenv("QDRANT_URL", str(base_dir / "Database" / "qdrant_data")),
@@ -84,6 +102,10 @@ class Config:
                 duckdb_path=os.getenv("DUCKDB_PATH", str(base_dir / "Database" / "talent_search.duckdb")),
                 embedding_model=os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2"),
                 embedding_dim=int(os.getenv("EMBEDDING_DIM", "768")),
+                jwt_secret=jwt_secret,
+                jwt_algorithm=jwt_algorithm,
+                default_client_id=default_client_id,
+                api_key_client_map_json=api_key_client_map_json,
             )
         else:
             # Production - require all env vars
@@ -108,6 +130,10 @@ class Config:
                 duckdb_path=duckdb_path,
                 embedding_model=os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2"),
                 embedding_dim=int(os.getenv("EMBEDDING_DIM", "768")),
+                jwt_secret=jwt_secret,
+                jwt_algorithm=jwt_algorithm,
+                default_client_id=default_client_id,
+                api_key_client_map_json=api_key_client_map_json,
             )
 
 

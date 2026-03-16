@@ -1,0 +1,169 @@
+{filters: {op: "and",…}, limit: 100, extracted: {,…}}
+extracted
+: 
+{,…}
+filters
+: 
+{op: "and",…}
+conditions
+: 
+[{column: "region", type: "[.]", value: "United States"}, {op: "or",…}, {op: "and",…}]
+0
+: 
+{column: "region", type: "[.]", value: "United States"}
+column
+: 
+"region"
+type
+: 
+"[.]"
+value
+: 
+"United States"
+1
+: 
+{op: "or",…}
+conditions
+: 
+[{op: "or", conditions: [{column: "headline", type: "[.]", value: "Senior Product Designer"},…]},…]
+0
+: 
+{op: "or", conditions: [{column: "headline", type: "[.]", value: "Senior Product Designer"},…]}
+conditions
+: 
+[{column: "headline", type: "[.]", value: "Senior Product Designer"},…]
+op
+: 
+"or"
+1
+: 
+{op: "or", conditions: [{column: "headline", type: "[.]", value: " Product Designer"},…]}
+conditions
+: 
+[{column: "headline", type: "[.]", value: " Product Designer"},…]
+op
+: 
+"or"
+2
+: 
+{op: "or", conditions: [{column: "headline", type: "[.]", value: " Lead Product Designer"},…]}
+conditions
+: 
+[{column: "headline", type: "[.]", value: " Lead Product Designer"},…]
+op
+: 
+"or"
+3
+: 
+{op: "or", conditions: [{column: "headline", type: "[.]", value: " Principal Product Designer"},…]}
+conditions
+: 
+[{column: "headline", type: "[.]", value: " Principal Product Designer"},…]
+0
+: 
+{column: "headline", type: "[.]", value: " Principal Product Designer"}
+column
+: 
+"headline"
+type
+: 
+"[.]"
+value
+: 
+" Principal Product Designer"
+1
+: 
+{column: "summary", type: "[.]", value: " Principal Product Designer"}
+column
+: 
+"summary"
+type
+: 
+"[.]"
+value
+: 
+" Principal Product Designer"
+2
+: 
+{column: "all_employers.title", type: "[.]", value: " Principal Product Designer"}
+column
+: 
+"all_employers.title"
+type
+: 
+"[.]"
+value
+: 
+" Principal Product Designer"
+op
+: 
+"or"
+4
+: 
+{op: "or", conditions: [{column: "headline", type: "[.]", value: " UX Designer"},…]}
+conditions
+: 
+[{column: "headline", type: "[.]", value: " UX Designer"},…]
+op
+: 
+"or"
+5
+: 
+{op: "or", conditions: [{column: "headline", type: "[.]", value: " UI/UX Designer"},…]}
+conditions
+: 
+[{column: "headline", type: "[.]", value: " UI/UX Designer"},…]
+op
+: 
+"or"
+6
+: 
+{op: "or", conditions: [{column: "headline", type: "[.]", value: " Senior UX Designer"},…]}
+conditions
+: 
+[{column: "headline", type: "[.]", value: " Senior UX Designer"},…]
+0
+: 
+{column: "headline", type: "[.]", value: " Senior UX Designer"}
+column
+: 
+"headline"
+type
+: 
+"[.]"
+value
+: 
+" Senior UX Designer"
+1
+: 
+{column: "summary", type: "[.]", value: " Senior UX Designer"}
+column
+: 
+"summary"
+type
+: 
+"[.]"
+value
+: 
+" Senior UX Designer"
+2
+: 
+{column: "all_employers.title", type: "[.]", value: " Senior UX Designer"}
+op
+: 
+"or"
+7
+: 
+{op: "or", conditions: [{column: "headline", type: "[.]", value: " Senior UI Designer"},…]}
+op
+: 
+"or"
+2
+: 
+{op: "and",…}
+op
+: 
+"and"
+limit
+: 
+100

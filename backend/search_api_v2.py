@@ -35,7 +35,8 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Filter, FieldCondition, MatchValue, MatchAny, Range,
-    SparseVector, Prefetch, FusionQuery, Fusion
+    SparseVector, Prefetch, FusionQuery, Fusion,
+    IsNullCondition, PayloadField
 )
 
 from config import get_config, Config
@@ -52,6 +53,17 @@ from normalizers import (
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Shared certification alias map (used in both search_v2 filtering and smart_rerank)
+CERT_ALIASES: Dict[str, List[str]] = {
+    'cpa': ['cpa', 'certified public accountant', 'uscpa', 'us cpa'],
+    'uscpa': ['uscpa', 'us cpa', 'cpa', 'certified public accountant'],
+    'pmp': ['pmp', 'project management professional'],
+    'cfa': ['cfa', 'chartered financial analyst'],
+    'cissp': ['cissp'],
+    'six sigma': ['six sigma', '6 sigma'],
+    'aws certified': ['aws certified', 'aws solutions architect', 'aws developer'],
+}
 
 
 # =============================================================================
@@ -150,12 +162,14 @@ def load_skill_relations() -> Dict[str, List[Tuple[str, float]]]:
         
         conn = get_db_connection()
         try:
+            config = get_config()
+            min_sim = config.skill_expansion_min_similarity
             rows = conn.execute("""
                 SELECT skill_a, skill_b, semantic_confidence
                 FROM skill_relationships
-                WHERE semantic_confidence >= 0.7
+                WHERE semantic_confidence >= ?
                 ORDER BY semantic_confidence DESC
-            """).fetchall()
+            """, [min_sim]).fetchall()
             
             relations: Dict[str, List[Tuple[str, float]]] = {}
             for skill_a, skill_b, sim in rows:
@@ -210,7 +224,7 @@ def expand_skills(skills: List[str], max_per_skill: int = 5) -> Dict[str, List[s
 # QDRANT SEARCH
 # =============================================================================
 
-def build_qdrant_filter(query: ParsedQueryV2) -> Optional[Filter]:
+def build_qdrant_filter(query: ParsedQueryV2, client_id: Optional[str] = None) -> Optional[Filter]:
     """
     Build Qdrant filter from parsed query.
     Normalizes all inputs for robust matching (handles aliases, abbreviations, case).
@@ -229,14 +243,13 @@ def build_qdrant_filter(query: ParsedQueryV2) -> Optional[Filter]:
             expanded.add(v)  # original
         return list(expanded)
     
-    # Skills - must_have (AND) - expand aliases + case variations
-    for skill in filters.skills.must_have:
-        skill_variations = expand_skill_search([skill])
-        # Add case variations for each alias
-        skill_variations = with_case_variations(skill_variations)
-        must_conditions.append(
-            FieldCondition(key="skills", match=MatchAny(any=skill_variations))
-        )
+    # Skills - must_have: NOT used as hard Qdrant filter anymore.
+    # Reason: ~50% of profiles have empty skills arrays (original scrapes lacked skills).
+    # These profiles may still be excellent matches (correct title, experience, company).
+    # Skills are instead handled by:
+    #   (1) Semantic embedding similarity (skills added to search_text)
+    #   (2) smart_rerank scoring (exact + text-based skill matching)
+    # This ensures the best profile comes on top regardless of skills array completeness.
     
     # Skills - exclude (NOT)
     for skill in filters.skills.exclude:
@@ -293,7 +306,24 @@ def build_qdrant_filter(query: ParsedQueryV2) -> Optional[Filter]:
         must_conditions.append(
             FieldCondition(key="years_experience", range=Range(lte=float(filters.experience.max_years)))
         )
-    
+
+    # Client isolation — restrict Qdrant results to this client's candidate data
+    # NOTE: ~227K legacy points (client 00) lack a client_id field in Qdrant payload
+    # (ingested before multi-tenant support). For client '00', we use OR logic to
+    # include points with client_id='00' OR points missing the field entirely.
+    if client_id:
+        if client_id == '00':
+            must_conditions.append(
+                Filter(should=[
+                    FieldCondition(key="client_id", match=MatchValue(value=client_id)),
+                    IsNullCondition(is_null=PayloadField(key="client_id"))
+                ])
+            )
+        else:
+            must_conditions.append(
+                FieldCondition(key="client_id", match=MatchValue(value=client_id))
+            )
+
     if must_conditions or must_not_conditions:
         return Filter(
             must=must_conditions if must_conditions else None,
@@ -397,16 +427,6 @@ def search_qdrant_hybrid(
     # Check which collection exists
     collections = [c.name for c in qdrant.get_collections().collections]
     
-    logger.info(f"Available Qdrant collections: {collections}")
-    logger.info(f"Using collection: {config.qdrant_collection}")
-    
-    # Check collection stats
-    try:
-        collection_info = qdrant.get_collection(config.qdrant_collection)
-        logger.info(f"Collection points count: {collection_info.points_count}")
-    except Exception as e:
-        logger.warning(f"Could not get collection info: {e}")
-    
     if config.qdrant_collection in collections:
         # Hybrid search with RRF fusion
         try:
@@ -416,18 +436,18 @@ def search_qdrant_hybrid(
                     Prefetch(
                         query=dense_vector,
                         using="dense",
-                        limit=limit * 3,
+                        limit=max(config.prefetch_limit, limit * 3),
                         filter=qdrant_filter
                     ),
                     Prefetch(
                         query=SparseVector(indices=sparse_indices, values=sparse_values),
                         using="sparse",
-                        limit=limit * 3,
+                        limit=max(config.prefetch_limit, limit * 3),
                         filter=qdrant_filter
                     ),
                 ],
                 query=FusionQuery(fusion=Fusion.RRF),
-                limit=limit * 2,
+                limit=max(config.fusion_limit, limit * 2),
                 with_payload=["forager_id"]
             ).points
         except Exception as e:
@@ -457,13 +477,26 @@ def search_qdrant_hybrid(
             detail=f"No Qdrant collection found. Run setup script first."
         )
     
-    # Extract forager_ids and scores
-    id_scores = []
+    # Extract forager_ids and normalize RRF scores to 0-1 range
+    raw_scores = []
     for hit in results:
         fid = hit.payload.get("forager_id") or hit.payload.get("person_id")
         if fid:
-            id_scores.append((int(fid), float(hit.score)))
-    
+            raw_scores.append((int(fid), float(hit.score)))
+
+    if not raw_scores:
+        return []
+
+    # Normalize: map [min_score, max_score] → [0.10, 0.65]
+    # This leaves headroom for ranking bonuses to push top candidates toward 1.0
+    scores_only = [s for _, s in raw_scores]
+    min_s, max_s = min(scores_only), max(scores_only)
+    spread = max_s - min_s if max_s > min_s else 1.0
+    id_scores = [
+        (fid, 0.10 + 0.55 * (score - min_s) / spread)
+        for fid, score in raw_scores
+    ]
+
     return id_scores
 
 
@@ -471,7 +504,13 @@ def search_qdrant_hybrid(
 # DUCKDB HYDRATION
 # =============================================================================
 
-def hydrate_profiles_from_duckdb(person_ids: List[int]) -> Dict[int, Dict]:
+def _safe_ids_str(ids: List[int]) -> str:
+    """Validate all IDs are integers and return a comma-separated string for SQL IN clause.
+    Prevents SQL injection if IDs are ever sourced from user input."""
+    return ','.join(str(int(i)) for i in ids)
+
+
+def hydrate_profiles_from_duckdb(person_ids: List[int], client_id: Optional[str] = None) -> Dict[int, Dict]:
     """
     Hydrate full profile details from DuckDB for given person IDs.
     Returns dict of {person_id: profile_dict}
@@ -481,7 +520,11 @@ def hydrate_profiles_from_duckdb(person_ids: List[int]) -> Dict[int, Dict]:
     
     conn = get_db_connection()
     try:
-        ids_str = ','.join(str(i) for i in person_ids)
+        ids_str = _safe_ids_str(person_ids)
+
+        # Client isolation — only return profiles belonging to this client
+        client_clause = "AND pp.client_id = ?" if client_id else ""
+        client_params = [client_id] if client_id else []
         
         # Fetch base profile data
         rows = conn.execute(f"""
@@ -517,8 +560,8 @@ def hydrate_profiles_from_duckdb(person_ids: List[int]) -> Dict[int, Dict]:
                 p.area
             FROM processed_profiles pp
             LEFT JOIN persons p ON pp.person_id = p.forager_id
-            WHERE pp.person_id IN ({ids_str})
-        """).fetchall()
+            WHERE pp.person_id IN ({ids_str}) {client_clause}
+        """, client_params).fetchall()
         
         columns = ['forager_id', 'full_name', 'city', 'state', 'country', 
                    'domain', 'years_experience', 'profile_completeness',
@@ -607,83 +650,63 @@ def calculate_ranking_bonus(
     base_score: float
 ) -> Tuple[float, List[str]]:
     """
-    Calculate ranking bonus and matched skills.
-    Returns (final_score, matched_skills).
+    PASS-1 ranking bonus applied inside search_v2().
+    Lightweight — only computes skill matching and matched_skills list.
+    The heavy re-ranking (titles, companies, location, experience, combo)
+    is done by smart_rerank() to avoid double-counting.
     """
     config = get_config()
     bonus = 0.0
     matched_skills = []
-    
-    # Skills coverage - search across skills array AND text fields (headline, title, description)
+
     profile_skills = set(s.lower() for s in (profile.get('skills') or []))
-    
-    # Helper: match skill against skills set
+
+    # Helper: word-boundary skill match (prevents "ML" matching "Email")
     def match_skill(query_skill: str, profile_skills_set: set) -> Optional[str]:
-        query_skill_lower = query_skill.lower()
+        q = query_skill.lower()
         for ps in profile_skills_set:
-            if query_skill_lower in ps or ps in query_skill_lower:
+            # Exact match
+            if q == ps:
                 return ps
+            # Query is a multi-word phrase contained in profile skill
+            if ' ' in q and q in ps:
+                return ps
+            # Profile skill is a multi-word phrase containing query
+            if ' ' in ps and q in ps:
+                return ps
+            # Single-token query: only match if it's a distinct token in profile skill
+            if ' ' not in q and len(q) >= 3:
+                ps_tokens = set(ps.replace('-', ' ').replace('.', ' ').split())
+                if q in ps_tokens:
+                    return ps
         return None
-    
-    # Must have skills - match strictly in skills array
+
+    # --- Must-have skills ---
     must_have = [s.lower() for s in query.filters.skills.must_have]
     for skill in must_have:
-        matched_ps = match_skill(skill, profile_skills)
-        if matched_ps:
+        if match_skill(skill, profile_skills):
             matched_skills.append(skill)
-    
+
     if must_have:
         coverage = len(matched_skills) / len(must_have)
-        bonus += coverage * config.bonus_skills_coverage
-    
-    # Nice to have skills boost - match strictly in skills array
+        # Light bonus — smart_rerank handles comprehensive skill scoring
+        bonus += coverage * 0.08
+
+    # --- Nice-to-have skills ---
     nice_to_have = [s.lower() for s in query.filters.skills.nice_to_have]
     nice_matched = []
     for skill in nice_to_have:
-        matched_ps = match_skill(skill, profile_skills)
-        if matched_ps:
+        if match_skill(skill, profile_skills):
             nice_matched.append(skill)
     matched_skills.extend(nice_matched)
-    
     if nice_to_have:
-        nice_coverage = len(nice_matched) / len(nice_to_have)
-        bonus += nice_coverage * 0.10  # Smaller bonus for nice-to-have
+        bonus += (len(nice_matched) / len(nice_to_have)) * 0.04
 
-    
-    # Experience fit
-    exp = profile.get('years_experience')
-    if exp is not None:
-        min_y = query.filters.experience.min_years
-        max_y = query.filters.experience.max_years
-        
-        if min_y is not None and max_y is not None:
-            if min_y <= exp <= max_y:
-                bonus += config.bonus_experience_fit
-            elif abs(exp - min_y) <= 2 or abs(exp - max_y) <= 2:
-                bonus += config.bonus_experience_fit * 0.5  # Partial bonus
-    
-    # Location match
-    loc = query.filters.location
-    if loc.city and profile.get('city', '').lower() == loc.city.lower():
-        bonus += config.bonus_location_exact
-    elif loc.state and profile.get('state', '').lower() == loc.state.lower():
-        bonus += config.bonus_location_nearby
-    elif loc.country and profile.get('country', '').lower() == loc.country.lower():
-        bonus += config.bonus_location_nearby * 0.5
-    
-    # Profile completeness
+    # --- Profile completeness (small baseline bonus) ---
     completeness = profile.get('profile_completeness') or 0
     bonus += (completeness / 100) * config.bonus_profile_completeness
-    
-    # Job titles boost - substring matching (not hard filter)
-    if query.filters.job_titles:
-        current_title = (profile.get('current_title') or '').lower()
-        for title_keyword in query.filters.job_titles:
-            if title_keyword.lower() in current_title:
-                bonus += config.bonus_title_match
-                break  # Only count once
-    
-    final_score = min(base_score + bonus, 1.0)  # Cap at 1.0
+
+    final_score = base_score + bonus
     return final_score, list(set(matched_skills))
 
 
@@ -694,13 +717,13 @@ def calculate_ranking_bonus(
 # Maximum query length to prevent DoS
 MAX_QUERY_LENGTH = 10000
 
-async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
+async def search_v2(query: ParsedQueryV2, client_id: Optional[str] = None) -> SearchResponseV2:
     """
     Main search function implementing the full flow:
     1. Expand skills
-    2. Build Qdrant filter
+    2. Build Qdrant filter (scoped to client_id)
     3. Query Qdrant
-    4. Hydrate from DuckDB
+    4. Hydrate from DuckDB (scoped to client_id)
     5. Apply ranking
     6. Return results
     """
@@ -763,9 +786,9 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
     if not search_text.strip():
         search_text = " ".join(search_skills) if search_skills else "professional"
     
-    # 3. Build Qdrant filter
+    # 3. Build Qdrant filter (scoped to client)
     t0 = time.time()
-    qdrant_filter = build_qdrant_filter(query)
+    qdrant_filter = build_qdrant_filter(query, client_id=client_id)
     timings['filter_build'] = int((time.time() - t0) * 1000)
     
     # DEBUG: Log the actual filter being sent to Qdrant
@@ -785,10 +808,10 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
     
     timings['qdrant_search'] = int((time.time() - t0) * 1000)
     
-    # 5. Hydrate from DuckDB
+    # 5. Hydrate from DuckDB (scoped to client)
     t0 = time.time()
     forager_ids = [fid for fid, _ in id_scores]
-    profiles = hydrate_profiles_from_duckdb(forager_ids)
+    profiles = hydrate_profiles_from_duckdb(forager_ids, client_id=client_id)
     timings['duckdb_fetch'] = int((time.time() - t0) * 1000)
     
     # 6. Apply ranking and build results
@@ -825,20 +848,9 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
                 cert_text_parts.append((wh.get('description') or '').lower())
             cert_blob = ' '.join(cert_text_parts)
 
-            # Cert keyword aliases — any token match counts
-            cert_aliases = {
-                'cpa': ['cpa', 'certified public accountant', 'uscpa', 'us cpa'],
-                'uscpa': ['uscpa', 'us cpa', 'cpa', 'certified public accountant'],
-                'pmp': ['pmp', 'project management professional'],
-                'cfa': ['cfa', 'chartered financial analyst'],
-                'cissp': ['cissp'],
-                'six sigma': ['six sigma', '6 sigma'],
-                'aws certified': ['aws certified', 'aws solutions architect', 'aws developer'],
-            }
-
             has_cert_match = False
             for target_cert in target_certifications:
-                aliases = cert_aliases.get(target_cert, [target_cert])
+                aliases = CERT_ALIASES.get(target_cert, [target_cert])
                 for alias in aliases:
                     if alias in cert_blob:
                         has_cert_match = True
@@ -881,11 +893,12 @@ async def search_v2(query: ParsedQueryV2) -> SearchResponseV2:
             current_company=profile.get('current_company'),
             location=location,
             city=profile.get('city'),
+            state=profile.get('state'),
             country=profile.get('country'),
             years_experience=profile.get('years_experience'),
             domain=profile.get('domain'),
             profile_completeness=profile.get('profile_completeness'),
-            skills=profile.get('skills', [])[:15],
+            skills=profile.get('skills', []),
             matched_skills=matched_skills,
             certifications=profile.get('certifications', []),
             matched_certifications=[],  # Will be calculated in smart_rerank
@@ -976,6 +989,17 @@ async def lifespan(app: FastAPI):
             logger.error(f"Failed to connect to Qdrant: {e}")
             raise
         
+        # Validate sparse encoder (BM25) availability
+        try:
+            encoder = get_sparse_encoder()
+            if not encoder.vocabulary:
+                logger.warning("⚠️  SPARSE ENCODER HAS NO VOCABULARY — running in dense-only mode. "
+                              "Keyword matching (BM25) is disabled. Run backfill_qdrant.py to generate sparse cache.")
+            else:
+                logger.info(f"Sparse encoder loaded: {len(encoder.vocabulary)} tokens")
+        except Exception as e:
+            logger.warning(f"⚠️  Sparse encoder unavailable: {e} — keyword matching disabled")
+        
         logger.info("=" * 60)
         logger.info("  STARTUP COMPLETE - Ready to serve requests")
         logger.info("=" * 60)
@@ -1034,6 +1058,14 @@ ALLOWED_ORIGINS = [
     "https://www.talentin.ai",
 ]
 
+# Mediator backend origin — set MEDIATOR_ORIGIN in .env if the mediator
+# frontend/backend lives on a different domain that needs browser CORS.
+# For server-to-server calls this is NOT required (CORS is browser-only).
+_mediator_origin = os.getenv("MEDIATOR_ORIGIN", "").strip()
+if _mediator_origin:
+    ALLOWED_ORIGINS.append(_mediator_origin)
+    logger.info(f"CORS: Mediator origin added: {_mediator_origin}")
+
 # Only allow localhost in development mode
 if _search_env in ("local", "development", "dev"):
     ALLOWED_ORIGINS.extend([
@@ -1049,8 +1081,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Client-ID", "X-Request-ID", "X-Integration-Key"],
 )
 
 
@@ -1076,14 +1108,15 @@ async def health():
 
 
 @app.post("/api/v2/search", response_model=SearchResponseV2)
-async def search_endpoint(query: ParsedQueryV2):
+async def search_endpoint(query: ParsedQueryV2, request: Request):
     """
     Main search endpoint.
-    
     Accepts parsed query JSON from external LLM API.
     Returns ranked candidates with modified skills.
     """
-    response = await search_v2(query)
+    from client_auth import require_client_id as _require_client_id
+    client_id = _require_client_id(request)
+    response = await search_v2(query, client_id=client_id)
     
     # Add city breakdown
     from collections import Counter
@@ -1159,47 +1192,184 @@ async def filter_by_cities(request: CityFilterRequest):
 
 
 
-@app.get("/api/stats")  # Legacy alias
-@app.get("/api/v2/stats")
-async def stats():
-    """Get database statistics"""
+# =============================================================================
+# CONSOLIDATED DASHBOARD ENDPOINT
+# One request → stats + chart data + all filter options, fully client-scoped.
+# Frontend should call GET /api/dashboard instead of the 10+ separate endpoints.
+# =============================================================================
+
+@app.get("/api/dashboard")
+async def dashboard(request: Request):
+    """
+    Single consolidated endpoint for all dashboard data.
+    Returns stats, chart data, and filter dropdowns in one shot.
+    All data is strictly scoped to the requesting client.
+    """
+    from client_auth import require_client_id as _req
+    from collections import Counter
+    client_id = _req(request)
     conn = get_db_connection()
     try:
-        total = conn.execute("SELECT COUNT(*) FROM processed_profiles").fetchone()[0]
-        
+        p = [client_id]  # reusable param list
+
+        total = conn.execute(
+            "SELECT COUNT(*) FROM processed_profiles WHERE client_id = ?", p
+        ).fetchone()[0]
+
         unique_countries = conn.execute("""
-            SELECT COUNT(DISTINCT canonical_country) 
-            FROM processed_profiles 
-            WHERE canonical_country IS NOT NULL AND canonical_country != ''
-        """).fetchone()[0]
-        
+            SELECT COUNT(DISTINCT canonical_country) FROM processed_profiles
+            WHERE canonical_country IS NOT NULL AND canonical_country != '' AND client_id = ?
+        """, p).fetchone()[0]
+
         unique_cities = conn.execute("""
-            SELECT COUNT(DISTINCT canonical_city) 
-            FROM processed_profiles 
-            WHERE canonical_city IS NOT NULL AND canonical_city != ''
-        """).fetchone()[0]
-        
-        unique_industries = conn.execute("""
-            SELECT COUNT(DISTINCT primary_domain) 
-            FROM processed_profiles 
-            WHERE primary_domain IS NOT NULL AND primary_domain != ''
-        """).fetchone()[0]
-        
-        total_skills = conn.execute("""
-            SELECT COUNT(*) FROM skills
-        """).fetchone()[0]
-        
-        domains = conn.execute("""
-            SELECT primary_domain, COUNT(*) as count
+            SELECT COUNT(DISTINCT canonical_city) FROM processed_profiles
+            WHERE canonical_city IS NOT NULL AND canonical_city != '' AND client_id = ?
+        """, p).fetchone()[0]
+
+        # Chart: top 10 countries
+        top_countries = conn.execute("""
+            SELECT canonical_country AS country, COUNT(*) AS count
             FROM processed_profiles
-            WHERE primary_domain IS NOT NULL
-            GROUP BY primary_domain
-            ORDER BY count DESC
-        """).fetchall()
-        
+            WHERE canonical_country IS NOT NULL AND canonical_country != '' AND client_id = ?
+            GROUP BY canonical_country ORDER BY count DESC LIMIT 10
+        """, p).fetchall()
+
+        # Chart: top 10 industries
+        top_industries = conn.execute("""
+            SELECT primary_domain AS industry, COUNT(*) AS count
+            FROM processed_profiles
+            WHERE primary_domain IS NOT NULL AND primary_domain != '' AND client_id = ?
+            GROUP BY primary_domain ORDER BY count DESC LIMIT 10
+        """, p).fetchall()
+
+        # Filters
+        f_countries = conn.execute("""
+            SELECT canonical_country, COUNT(*) AS cnt FROM processed_profiles
+            WHERE canonical_country IS NOT NULL AND canonical_country != '' AND client_id = ?
+            GROUP BY canonical_country ORDER BY cnt DESC
+        """, p).fetchall()
+
+        f_cities = conn.execute("""
+            SELECT canonical_city, COUNT(*) AS cnt FROM processed_profiles
+            WHERE canonical_city IS NOT NULL AND canonical_city != '' AND client_id = ?
+            GROUP BY canonical_city ORDER BY cnt DESC LIMIT 300
+        """, p).fetchall()
+
+        f_industries = conn.execute("""
+            SELECT primary_domain, COUNT(*) AS cnt FROM processed_profiles
+            WHERE primary_domain IS NOT NULL AND primary_domain != '' AND client_id = ?
+            GROUP BY primary_domain ORDER BY cnt DESC LIMIT 100
+        """, p).fetchall()
+
+        f_roles = conn.execute("""
+            SELECT r.role_title, COUNT(*) AS cnt
+            FROM roles r INNER JOIN processed_profiles pp ON r.forager_id = pp.person_id
+            WHERE r.role_title IS NOT NULL AND r.role_title != '' AND pp.client_id = ?
+            GROUP BY r.role_title ORDER BY cnt DESC LIMIT 100
+        """, p).fetchall()
+
+        f_schools = conn.execute("""
+            SELECT e.school_name, COUNT(*) AS cnt
+            FROM educations e INNER JOIN processed_profiles pp ON e.forager_id = pp.person_id
+            WHERE e.school_name IS NOT NULL AND e.school_name != '' AND pp.client_id = ?
+            GROUP BY e.school_name ORDER BY cnt DESC LIMIT 100
+        """, p).fetchall()
+
+        f_certs = conn.execute("""
+            SELECT c.certificate_name, COUNT(*) AS cnt
+            FROM certifications c INNER JOIN processed_profiles pp ON c.forager_id = pp.person_id
+            WHERE c.certificate_name IS NOT NULL AND c.certificate_name != '' AND pp.client_id = ?
+            GROUP BY c.certificate_name ORDER BY cnt DESC LIMIT 100
+        """, p).fetchall()
+
+        # Skills from canonical_skills column (avoid expensive unnest join)
+        skill_rows = conn.execute("""
+            SELECT canonical_skills FROM processed_profiles
+            WHERE canonical_skills IS NOT NULL AND client_id = ?
+        """, p).fetchall()
+    finally:
+        conn.close()
+
+    # Aggregate skills
+    skill_counter: Counter = Counter()
+    for (skills_raw,) in skill_rows:
+        if skills_raw:
+            lst = skills_raw if isinstance(skills_raw, list) else []
+            for sk in lst:
+                if sk:
+                    skill_counter[sk.strip()] += 1
+
+    def fmt(rows):
+        return [{"value": r[0], "label": r[0], "count": r[1]} for r in rows if r[0]]
+
+    return {
+        "client_id": client_id,
+        "stats": {
+            "total_records": total,
+            "unique_countries": unique_countries,
+            "unique_cities": unique_cities,
+            "total_skills": sum(skill_counter.values()),
+        },
+        "charts": {
+            "countries": [{"country": r[0], "count": r[1]} for r in top_countries if r[0]],
+            "industries": [{"industry": r[0], "count": r[1]} for r in top_industries if r[0]],
+        },
+        "filters": {
+            "countries":     fmt(f_countries),
+            "cities":        fmt(f_cities),
+            "industries":    fmt(f_industries),
+            "roles":         fmt(f_roles),
+            "schools":       fmt(f_schools),
+            "certifications":fmt(f_certs),
+            "skills":        [{"value": sk, "label": sk, "count": cnt} for sk, cnt in skill_counter.most_common(100) if sk],
+        },
+    }
+
+
+@app.get("/api/stats")  # Legacy alias
+@app.get("/api/v2/stats")
+async def stats(request: Request):
+    """Get database statistics — use /api/dashboard for the full data in one call."""
+    from client_auth import require_client_id as _req
+    client_id = _req(request)
+    p = [client_id]
+
+    conn = get_db_connection()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM processed_profiles WHERE client_id = ?", p
+        ).fetchone()[0]
+
+        unique_countries = conn.execute("""
+            SELECT COUNT(DISTINCT canonical_country) FROM processed_profiles
+            WHERE canonical_country IS NOT NULL AND canonical_country != '' AND client_id = ?
+        """, p).fetchone()[0]
+
+        unique_cities = conn.execute("""
+            SELECT COUNT(DISTINCT canonical_city) FROM processed_profiles
+            WHERE canonical_city IS NOT NULL AND canonical_city != '' AND client_id = ?
+        """, p).fetchone()[0]
+
+        unique_industries = conn.execute("""
+            SELECT COUNT(DISTINCT primary_domain) FROM processed_profiles
+            WHERE primary_domain IS NOT NULL AND primary_domain != '' AND client_id = ?
+        """, p).fetchone()[0]
+
+        total_skills = conn.execute("""
+            SELECT COUNT(*) FROM skills s
+            INNER JOIN processed_profiles pp ON s.forager_id = pp.person_id
+            WHERE pp.client_id = ?
+        """, p).fetchone()[0]
+
+        domains = conn.execute("""
+            SELECT primary_domain, COUNT(*) as count FROM processed_profiles
+            WHERE primary_domain IS NOT NULL AND client_id = ?
+            GROUP BY primary_domain ORDER BY count DESC
+        """, p).fetchall()
+
         return {
             "total_records": total,
-            "total_profiles": total,  # Keep for backwards compatibility
+            "total_profiles": total,
             "unique_countries": unique_countries,
             "unique_cities": unique_cities,
             "unique_industries": unique_industries,
@@ -1237,9 +1407,9 @@ from filter_service import (
 
 
 @app.get("/api/v2/filters/facets", response_model=FacetsResponse)
-async def facets_endpoint(current_filters: Optional[str] = None):
+async def facets_endpoint(request: Request, current_filters: Optional[str] = None):
     """
-    Get filter facets with counts.
+    Get filter facets with counts, scoped to the requesting client.
     
     Returns top skills, locations, companies, experience ranges, and domains
     with counts based on current filter state.
@@ -1252,6 +1422,8 @@ async def facets_endpoint(current_filters: Optional[str] = None):
         FacetsResponse with all facet types and counts
     """
     import json
+    from client_auth import require_client_id as _req
+    client_id = _req(request)
     
     filters_dict = None
     if current_filters:
@@ -1260,13 +1432,13 @@ async def facets_endpoint(current_filters: Optional[str] = None):
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in current_filters")
     
-    return get_all_facets(filters_dict)
+    return get_all_facets(filters_dict, client_id=client_id)
 
 
 @app.get("/api/v2/autocomplete/{field}", response_model=AutocompleteResponse)
-async def autocomplete_endpoint(field: str, q: str, limit: int = 10):
+async def autocomplete_endpoint(request: Request, field: str, q: str, limit: int = 10):
     """
-    Real-time autocomplete for filter fields.
+    Real-time autocomplete for filter fields, scoped to the requesting client.
     
     Args:
         field: Field to autocomplete (skills, companies, locations, titles)
@@ -1279,6 +1451,9 @@ async def autocomplete_endpoint(field: str, q: str, limit: int = 10):
     Example:
         GET /api/v2/autocomplete/skills?q=pyth&limit=5
     """
+    from client_auth import require_client_id as _req
+    client_id = _req(request)
+
     valid_fields = ["skills", "companies", "locations", "titles"]
     if field.lower() not in valid_fields:
         raise HTTPException(
@@ -1292,13 +1467,13 @@ async def autocomplete_endpoint(field: str, q: str, limit: int = 10):
             detail="Query must be at least 2 characters"
         )
     
-    return autocomplete(field, q, min(limit, 50))
+    return autocomplete(field, q, min(limit, 50), client_id=client_id)
 
 
 @app.get("/api/v2/filters/metadata", response_model=FilterMetadataResponse)
-async def filter_metadata_endpoint():
+async def filter_metadata_endpoint(request: Request):
     """
-    Get metadata about all available filters.
+    Get metadata about all available filters, scoped to the requesting client.
     
     Returns:
         - Total profile count
@@ -1306,7 +1481,9 @@ async def filter_metadata_endpoint():
         - Top 10 values for skills
         - Experience min/max/avg
     """
-    return get_filter_metadata()
+    from client_auth import require_client_id as _req
+    client_id = _req(request)
+    return get_filter_metadata(client_id=client_id)
 
 
 @app.post("/api/v2/filters/cache/clear")
@@ -1551,11 +1728,16 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
         else:
             parsed_result.options.limit = min(limit * 5, 500)
         
-        # Enrich search_text with titles + location + domain for semantic matching
+        # Enrich search_text with titles + skills + location + domain for semantic matching
         # (these are NOT hard Qdrant filters — they rely on embedding similarity)
         enriched = parsed_result.search_text or request.query
         if parsed_result.filters.job_titles:
             enriched += " " + " ".join(parsed_result.filters.job_titles)
+        if parsed_result.filters.skills.must_have:
+            # Skills are no longer hard Qdrant filters — ensure they're in semantic text
+            enriched += " " + " ".join(parsed_result.filters.skills.must_have)
+        if parsed_result.filters.skills.nice_to_have:
+            enriched += " " + " ".join(parsed_result.filters.skills.nice_to_have[:5])
         if parsed_result.filters.domain:
             # Add domain keywords to semantic search instead of using as hard filter
             domain_keywords = parsed_result.filters.domain.replace("_", " ")
@@ -1579,11 +1761,18 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
         parsed_result.filters.location.country = None
         
         # Build smart_filters for post-processing (location modes, query understanding)
+        # Expand skills & companies so smart_rerank() can award expanded-match bonuses
+        _all_skills_openai = parsed_result.filters.skills.must_have + parsed_result.filters.skills.nice_to_have
+        _skill_exp_openai = expand_skills(_all_skills_openai) if _all_skills_openai else {}
+        _exp_skill_list_openai = list({s for related in _skill_exp_openai.values() for s in related})
+        from normalizers import expand_company_search as _expand_co
+        _exp_company_list_openai = _expand_co(parsed_result.filters.companies.worked_at) if parsed_result.filters.companies.worked_at else []
+
         smart_filters = {
-            "skills": parsed_result.filters.skills.must_have + parsed_result.filters.skills.nice_to_have,
-            "expanded_skills": [],
+            "skills": _all_skills_openai,
+            "expanded_skills": _exp_skill_list_openai,
             "companies": parsed_result.filters.companies.worked_at,
-            "expanded_companies": [],
+            "expanded_companies": _exp_company_list_openai,
             "certifications": parsed_result.filters.certifications if hasattr(parsed_result.filters, 'certifications') else [],
             "city": original_city,
             "state": original_state,
@@ -1668,11 +1857,16 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
             "titles": extracted.titles,
         }
     
-    # 3. Execute search with parsed query
+    # 3. Execute search with parsed query (scoped to client)
+    from client_auth import require_client_id as _get_client_id
+    from fastapi import HTTPException
+    if not http_request:
+        raise HTTPException(status_code=403, detail="Cannot determine client context.")
+    client_id = _get_client_id(http_request)
     logger.info(f"🔍 Executing Qdrant search: text='{parsed_result.search_text[:60]}...', "
                f"skills={parsed_result.filters.skills.must_have[:3]}, "
-               f"limit={parsed_result.options.limit}")
-    response = await search_v2(parsed_result)
+               f"limit={parsed_result.options.limit}, client='{client_id}'")
+    response = await search_v2(parsed_result, client_id=client_id)
     
     logger.info(f"📊 Qdrant results: {len(response.results)} candidates | "
                f"took={response.took_ms}ms | "
@@ -1690,6 +1884,23 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
         logger.info(f"   Top 5 scores: {[f'{r.score:.3f}' for r in reranked_results[:5]]}")
     else:
         logger.info("✅ After re-ranking: no results")
+    
+    # 4b. Experience post-filter — catch profiles with null/stale Qdrant experience data
+    smart_min = smart_filters.get("min_years")
+    smart_max = smart_filters.get("max_years")
+    if smart_min is not None or smart_max is not None:
+        before_exp = len(reranked_results)
+        def _exp_ok(r):
+            yrs = r.years_experience
+            if yrs is None:
+                return False
+            if smart_min is not None and yrs < smart_min:
+                return False
+            if smart_max is not None and yrs > smart_max:
+                return False
+            return True
+        reranked_results = [r for r in reranked_results if _exp_ok(r)]
+        logger.info(f"Experience post-filter: {before_exp} → {len(reranked_results)}")
     
     # Calculate facets from results
     facets = calculate_location_facets(reranked_results)
@@ -1711,6 +1922,9 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
             if target_location in (r.city or "").lower()
             or target_location in (getattr(r, 'location', '') or "").lower()
             or target_location in (r.country or "").lower()
+            or target_location in (getattr(r, 'state', '') or "").lower()
+            or target_location in (getattr(r, 'linkedin_area', '') or "").lower()
+            or target_location in (getattr(r, 'area', '') or "").lower()
         ]
         logger.info(f"MUST_MATCH: {before} → {len(results)} (location: {target_location})")
     elif location_preference == "remote":
@@ -1787,7 +2001,7 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
     Args:
         results: List of candidates to rank
         filters: Dict with extracted filters (skills, city, titles, etc.)
-        location_preference: "remote" (no location boost), "preferred" (+0.80 boost), "must_match" (+3.0 boost)
+        location_preference: "remote" (no location boost), "preferred" (+0.12 city), "must_match" (+0.60 city, post-filter)
     """
     if not results:
         return results
@@ -1808,7 +2022,8 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
     # Build title keywords for fuzzy matching (e.g. "software engineer" -> {"software", "engineer"})
     title_keywords = set()
     for t in target_titles:
-        title_keywords.update(w for w in t.split() if len(w) > 2)
+        # len > 1 so we keep short but important codes like QA, ML, AI, PM, VP, UX
+        title_keywords.update(w for w in t.split() if len(w) > 1)
     
     logger.info(f"Re-ranking {len(results)} candidates with: location_preference={location_preference}, "
                f"city='{target_city}', titles={list(target_titles)[:2]}, "
@@ -1820,6 +2035,8 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         bonus = 0.0
         bonus_details = []
         all_matched_skills = []
+        location_matched = False
+        exp_matched = False
         
         # ── 1. SKILLS MATCH ──────────────────────────────────────────
         profile_skills = set(s.lower() for s in (result.skills or []))
@@ -1828,59 +2045,113 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         exact_matches = target_skills & profile_skills
         if target_skills:
             skill_coverage = len(exact_matches) / len(target_skills)
-            skill_bonus = skill_coverage * 0.30
+            skill_bonus = skill_coverage * 0.10
             bonus += skill_bonus
             all_matched_skills.extend(exact_matches)
             if skill_bonus > 0:
                 bonus_details.append(f"skills+{skill_bonus:.2f}")
         
-        # 1b. Skills mentioned in headline/description/title (lower confidence fallback)
+        # 1b. Skills mentioned in headline/description/title/work_history (lower confidence fallback)
         missing_skills = target_skills - exact_matches
         if missing_skills:
+            import re as _re
             profile_text = " ".join([
                 (result.headline or ""),
                 (result.current_title or ""),
                 (result.description or ""),
+            ] + [
+                (wh.get('title') or "") + " " + (wh.get('description') or "")
+                for wh in (result.work_history or [])[:5]
             ]).lower()
             text_matched = set()
             for skill in missing_skills:
-                if skill in profile_text:
-                    text_matched.add(skill)
+                # Short skills (≤2 chars like "go", "r") need word-boundary matching
+                # to avoid false positives (e.g. "go" matching "good programmer")
+                if len(skill) <= 2:
+                    if _re.search(r'\b' + _re.escape(skill) + r'\b', profile_text):
+                        text_matched.add(skill)
+                else:
+                    if skill in profile_text:
+                        text_matched.add(skill)
             if text_matched:
-                text_bonus = (len(text_matched) / len(target_skills)) * 0.10  # Lower weight than array match
+                text_bonus = (len(text_matched) / len(target_skills)) * 0.06  # Increased from 0.04
                 bonus += text_bonus
                 all_matched_skills.extend(text_matched)
                 bonus_details.append(f"skills_text+{text_bonus:.2f}")
         
-        # 1c. Expanded skill matches (related skills)
+        # 1c. Expanded skill matches (related skills — award even if some exact matches exist)
         expanded_matches = expanded_skills & profile_skills
-        if expanded_skills and not exact_matches:
+        if expanded_skills and expanded_matches:
             expanded_coverage = len(expanded_matches) / len(expanded_skills)
-            exp_bonus = expanded_coverage * 0.12
+            exp_bonus = expanded_coverage * 0.04
             bonus += exp_bonus
             all_matched_skills.extend(expanded_matches)
             if exp_bonus > 0:
                 bonus_details.append(f"expanded+{exp_bonus:.2f}")
         
+        # 1d. RELEVANCE PENALTY — demote profiles with zero skill relevance
+        if target_skills and not all_matched_skills:
+            # Profile matched NONE of the requested skills (array, text, or expanded)
+            bonus -= 0.15
+            bonus_details.append("no_skills-0.15")
+        
+        # 1e. EMPTY PROFILE PENALTY — demote profiles with no useful data
+        has_headline = bool(result.headline and result.headline.strip() and result.headline.strip() != '--')
+        has_summary = bool(result.description and len(result.description.strip()) > 20)
+        has_skills = bool(result.skills and len(result.skills) > 0)
+        
+        if target_skills and not has_skills and not has_summary:
+            # Profile has no skills AND no meaningful summary — very likely irrelevant
+            bonus -= 0.10
+            bonus_details.append("empty_profile-0.10")
+        
         # ── 2. LOCATION MATCH ────────────────────────────────────────
-        if location_preference != "remote" and target_city:
+        location_matched = False
+        if location_preference != "remote" and (target_city or target_state or target_country):
             profile_location = (result.location or "").lower()
             profile_city = (result.city or "").lower()
+            profile_state = (result.state or "").lower()
+            profile_country = (result.country or "").lower()
             
             if location_preference == "must_match":
-                city_boost, state_boost, country_boost = 3.0, 1.5, 0.75
-            else:  # "preferred"
-                city_boost, state_boost, country_boost = 0.80, 0.40, 0.25
+                city_boost, state_boost, country_boost = 0.60, 0.30, 0.15
+            else:  # "preferred" — strong boost to lift local candidates
+                city_boost, state_boost, country_boost = 0.25, 0.12, 0.06
             
-            if target_city and (target_city in profile_location or target_city in profile_city):
-                bonus += city_boost
-                bonus_details.append(f"city+{city_boost:.2f}")
-            elif target_state and target_state in profile_location:
+            # City matching: prefer exact match, then check linkedin_area/area, then substring
+            if target_city:
+                if profile_city == target_city:
+                    # Exact city match — highest confidence
+                    bonus += city_boost
+                    bonus_details.append(f"city+{city_boost:.2f}")
+                    location_matched = True
+                elif target_city in (getattr(result, 'linkedin_area', '') or '').lower():
+                    bonus += city_boost
+                    bonus_details.append(f"city_area+{city_boost:.2f}")
+                    location_matched = True
+                elif target_city in (getattr(result, 'area', '') or '').lower():
+                    bonus += city_boost
+                    bonus_details.append(f"city_area+{city_boost:.2f}")
+                    location_matched = True
+                elif target_city in profile_location:
+                    # Substring fallback for combined location strings
+                    bonus += city_boost
+                    bonus_details.append(f"city+{city_boost:.2f}")
+                    location_matched = True
+            if not location_matched and target_state and (target_state == profile_state or target_state in profile_location):
                 bonus += state_boost
                 bonus_details.append(f"state+{state_boost:.2f}")
-            elif target_country and target_country in profile_location:
+                location_matched = True
+            if not location_matched and target_country and (target_country == profile_country or target_country in profile_location):
                 bonus += country_boost
                 bonus_details.append(f"country+{country_boost:.2f}")
+                location_matched = True
+        
+        # 2b. LOCATION NON-MATCH PENALTY — demote profiles not in requested location
+        if not location_matched and (target_city or target_state or target_country):
+            if location_preference != "remote":
+                bonus -= 0.08
+                bonus_details.append("no_location-0.08")
         
         # ── 3. TITLE MATCH (comprehensive) ────────────────────────────
         profile_title = (result.current_title or "").lower()
@@ -1890,8 +2161,8 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         # 3a. Exact substring match in current_title
         for target_title in target_titles:
             if target_title in profile_title:
-                bonus += 0.50
-                bonus_details.append("title+0.50")
+                bonus += 0.10
+                bonus_details.append("title+0.10")
                 title_matched = True
                 break
         
@@ -1902,7 +2173,7 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
             if overlap:
                 overlap_ratio = len(overlap) / len(title_keywords)
                 if overlap_ratio >= 0.5:  # At least half the words match
-                    partial_bonus = overlap_ratio * 0.25
+                    partial_bonus = overlap_ratio * 0.06
                     bonus += partial_bonus
                     bonus_details.append(f"title_partial+{partial_bonus:.2f}")
                     title_matched = True
@@ -1911,8 +2182,22 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         if not title_matched and profile_headline:
             for target_title in target_titles:
                 if target_title in profile_headline:
-                    bonus += 0.15
-                    bonus_details.append("headline_title+0.15")
+                    bonus += 0.04
+                    bonus_details.append("headline_title+0.04")
+                    break
+        
+        # 3d. Work history title match (past roles matching target title)
+        if not title_matched and result.work_history:
+            for i, work_exp in enumerate(result.work_history[:5]):
+                past_title = (work_exp.get('title') or "").lower()
+                for target_title in target_titles:
+                    if target_title in past_title:
+                        wh_bonus = 0.06 if i == 0 else 0.03
+                        bonus += wh_bonus
+                        bonus_details.append(f"wh_title+{wh_bonus:.2f}")
+                        title_matched = True
+                        break
+                if title_matched:
                     break
         
         # ── 4. COMPANY MATCH ──────────────────────────────────────────
@@ -1921,8 +2206,8 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         company_matched = False
         for target_company in all_companies:
             if target_company in profile_company:
-                bonus += 0.25
-                bonus_details.append("curr_company+0.25")
+                bonus += 0.06
+                bonus_details.append("curr_company+0.06")
                 company_matched = True
                 break
         
@@ -1932,8 +2217,8 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
                 past_company = (work_exp.get('company') or "").lower()
                 for target_company in all_companies:
                     if target_company in past_company:
-                        bonus += 0.15  # Lower than current company
-                        bonus_details.append("past_company+0.15")
+                        bonus += 0.04  # Lower than current company
+                        bonus_details.append("past_company+0.04")
                         company_matched = True
                         break
                 if company_matched:
@@ -1942,19 +2227,10 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         # ── 5. CERTIFICATION MATCH ────────────────────────────────────
         matched_certs = []
         if target_certifications:
-            cert_aliases = {
-                'cpa': ['cpa', 'certified public accountant', 'uscpa', 'us cpa'],
-                'uscpa': ['uscpa', 'us cpa', 'cpa', 'certified public accountant'],
-                'pmp': ['pmp', 'project management professional'],
-                'cfa': ['cfa', 'chartered financial analyst'],
-                'cissp': ['cissp'],
-                'six sigma': ['six sigma', '6 sigma'],
-                'aws certified': ['aws certified', 'aws solutions architect', 'aws developer'],
-            }
             # Build full-text blob from all profile text fields
             cert_text_parts = [c.lower() for c in (result.certifications or [])]
             cert_text_parts.append((result.headline or '').lower())
-            cert_text_parts.append((result.job_title or '').lower())
+            cert_text_parts.append((result.current_title or '').lower())
             cert_text_parts.append((getattr(result, 'description', '') or '').lower())
             for wh in (getattr(result, 'work_history', None) or []):
                 cert_text_parts.append((wh.get('title') or '').lower())
@@ -1962,7 +2238,7 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
             cert_blob = ' '.join(cert_text_parts)
 
             for target_cert in target_certifications:
-                aliases = cert_aliases.get(target_cert, [target_cert])
+                aliases = CERT_ALIASES.get(target_cert, [target_cert])
                 for alias in aliases:
                     if alias in cert_blob:
                         matched_certs.append(target_cert)
@@ -1970,11 +2246,12 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
 
             if matched_certs:
                 cert_coverage = len(set(matched_certs)) / len(target_certifications)
-                cert_bonus = cert_coverage * 0.50  # Up to +0.50 for all certs matched
+                cert_bonus = cert_coverage * 0.10  # Up to +0.10 for all certs matched
                 bonus += cert_bonus
                 bonus_details.append(f"certs+{cert_bonus:.2f}")
         
-        # ── 6. EXPERIENCE MATCH (with proximity scoring) ──────────────
+        # ── 6. EXPERIENCE MATCH (continuous proximity scoring) ─────────
+        exp_matched = False
         exp = result.years_experience
         if exp is not None and (min_years is not None or max_years is not None):
             effective_min = min_years if min_years is not None else 0
@@ -1982,46 +2259,69 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
             
             if effective_min <= exp <= effective_max:
                 # In range — full bonus
-                bonus += 0.25
-                bonus_details.append("exp+0.25")
+                bonus += 0.06
+                bonus_details.append("exp+0.06")
+                exp_matched = True
             else:
-                # Out of range — proximity bonus (closer = better)
-                if min_years is not None and max_years is not None:
-                    ideal = (min_years + max_years) / 2
-                else:
-                    ideal = min_years or max_years or 0
+                # Out of range — continuous decay (closer to ideal = higher bonus)
+                ideal = (effective_min + effective_max) / 2
                 diff = abs(exp - ideal)
-                if diff <= 2:
-                    bonus += 0.15
-                    bonus_details.append("exp~+0.15")
-                elif diff <= 5:
-                    bonus += 0.08
-                    bonus_details.append("exp~+0.08")
+                proximity = max(0.0, 1.0 - diff / 8.0)  # Decays over 8 years
+                exp_bonus = round(proximity * 0.04, 3)
+                if exp_bonus > 0:
+                    bonus += exp_bonus
+                    bonus_details.append(f"exp~+{exp_bonus:.2f}")
         
         # ── 7. PROFILE QUALITY BONUS ──────────────────────────────────
         # Reward complete profiles (they're more useful to recruiters)
         completeness = result.profile_completeness or 0
         if completeness > 70:
-            quality_bonus = 0.05
+            quality_bonus = 0.02
             bonus += quality_bonus
         
+        # ── 8. MULTI-AXIS COMBO BONUS ─────────────────────────────────
+        # Candidates matching on multiple dimensions simultaneously are
+        # disproportionately likely to be the right person.
+        matched_axes = sum([
+            bool(exact_matches),           # has required skills
+            title_matched,                 # title match
+            location_matched,              # location match
+            company_matched,               # company match
+            exp_matched,                   # experience match
+            bool(matched_certs),           # certification match
+        ])
+        if matched_axes >= 4:
+            bonus += 0.06
+            bonus_details.append("combo4+0.06")
+        elif matched_axes >= 3:
+            bonus += 0.04
+            bonus_details.append("combo3+0.04")
+        elif matched_axes >= 2:
+            bonus += 0.02
+            bonus_details.append("combo2+0.02")
+        
         # ── FINAL SCORE ───────────────────────────────────────────────
-        new_score = min(result.score + bonus, 1.0)
+        # Base scores are normalized to [0.10, 0.65] so bonuses push
+        # strong candidates toward 1.0. Cap at 1.0 for clean semantics.
+        raw_score = result.score + bonus
+        display_score = min(raw_score, 1.0)
         
         # Log first 5 for debugging
         if len(reranked) < 5:
             logger.info(f"  Candidate: {result.full_name[:25]} | {(result.city or 'no-city')[:15]} | "
-                       f"base={result.score:.3f} bonus={bonus:.3f} final={new_score:.3f} | {bonus_details}")
+                       f"base={result.score:.3f} bonus={bonus:.3f} final={display_score:.3f} | {bonus_details}")
         
+        # Store raw_score temporarily for correct sorting; display_score shown to user
         # Create new result with updated score and comprehensive matched skills
         reranked.append(CandidateResultV2(
             forager_id=result.forager_id,
-            score=round(new_score, 4),
+            score=round(raw_score, 6),   # raw for sorting
             full_name=result.full_name,
             current_title=result.current_title,
             current_company=result.current_company,
             location=result.location,
             city=result.city,
+            state=result.state,
             country=result.country,
             years_experience=result.years_experience,
             domain=result.domain,
@@ -2052,8 +2352,10 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
             area=result.area
         ))
     
-    # Sort by new score (highest first)
+    # Sort by raw score (highest first), then cap for display
     reranked.sort(key=lambda x: x.score, reverse=True)
+    for r in reranked:
+        r.score = round(min(r.score, 1.0), 4)
     
     # Log top 3 results for debugging
     if reranked:
@@ -2122,20 +2424,24 @@ def filter_by_locations(results: List[CandidateResultV2], selected_locations: Li
 # LEGACY API ENDPOINTS (for frontend compatibility)
 # =============================================================================
 
-@app.get("/api/stats")
-async def legacy_get_stats():
+@app.get("/api/stats/simple")
+async def legacy_get_stats(request: Request):
     """Get basic statistics for the dashboard"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
+        p = [client_id]
+
         conn = get_db_connection()
-        total = conn.execute("SELECT COUNT(*) FROM processed_profiles").fetchone()[0]
-        countries = conn.execute("SELECT COUNT(DISTINCT canonical_country) FROM processed_profiles WHERE canonical_country IS NOT NULL AND canonical_country != ''").fetchone()[0]
-        cities = conn.execute("SELECT COUNT(DISTINCT canonical_city) FROM processed_profiles WHERE canonical_city IS NOT NULL AND canonical_city != ''").fetchone()[0]
-        industries = conn.execute("SELECT COUNT(DISTINCT primary_domain) FROM processed_profiles WHERE primary_domain IS NOT NULL AND primary_domain != ''").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM processed_profiles WHERE client_id = ?", p).fetchone()[0]
+        countries = conn.execute("SELECT COUNT(DISTINCT canonical_country) FROM processed_profiles WHERE canonical_country IS NOT NULL AND canonical_country != '' AND client_id = ?", p).fetchone()[0]
+        cities = conn.execute("SELECT COUNT(DISTINCT canonical_city) FROM processed_profiles WHERE canonical_city IS NOT NULL AND canonical_city != '' AND client_id = ?", p).fetchone()[0]
+        industries = conn.execute("SELECT COUNT(DISTINCT primary_domain) FROM processed_profiles WHERE primary_domain IS NOT NULL AND primary_domain != '' AND client_id = ?", p).fetchone()[0]
         conn.close()
         return {
             "total_profiles": total,
             "total_countries": countries,
-            "total_cities": cities, 
+            "total_cities": cities,
             "total_industries": industries
         }
     except Exception as e:
@@ -2144,6 +2450,7 @@ async def legacy_get_stats():
 
 @app.get("/api/search")
 async def legacy_search(
+    request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     skills: Optional[str] = None,
@@ -2164,12 +2471,19 @@ async def legacy_search(
 ):
     """Legacy search endpoint - uses direct SQL for proper filtering"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
+
         conn = get_db_connection()
         
         # Build dynamic SQL with proper WHERE clauses
         where_clauses = []
         params = []
         joins = []
+
+        # Client isolation - always scope to the authenticated client's data
+        where_clauses.append("pp.client_id = ?")
+        params.append(client_id)
         
         # Quick search - searches across name, headline, title, company
         if quick_search:
@@ -2446,31 +2760,49 @@ async def legacy_search(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/filters/skills")
-async def legacy_get_skills(limit: int = 100):
-    """Get top skills for filters"""
+async def legacy_get_skills(request: Request, limit: int = 100):
+    """Get top skills for filters (scoped to client's candidates)"""
     try:
-        from filter_service import get_skill_facets
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
         conn = get_db_connection()
-        facets = get_skill_facets(conn, limit=limit)
+        # Extract skills from processed_profiles for this client
+        rows = conn.execute("""
+            SELECT canonical_skills
+            FROM processed_profiles
+            WHERE canonical_skills IS NOT NULL AND client_id = ?
+        """, [client_id]).fetchall()
         conn.close()
-        return [{"value": f.value, "label": f.label, "count": f.count} for f in facets]
+        from collections import Counter
+        skill_counter: Counter = Counter()
+        for (skills_raw,) in rows:
+            if skills_raw:
+                skill_list = skills_raw if isinstance(skills_raw, list) else []
+                for sk in skill_list:
+                    if sk:
+                        skill_counter[sk.strip()] += 1
+        top = skill_counter.most_common(limit)
+        return [{"value": sk, "label": sk, "count": cnt} for sk, cnt in top if sk]
     except Exception as e:
         logger.error(f"Error in legacy_get_skills: {e}")
         return []
 
 
 @app.get("/api/filters/countries")
-async def legacy_get_countries():
+async def legacy_get_countries(request: Request):
     """Get all countries"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
         conn = get_db_connection()
         results = conn.execute("""
             SELECT DISTINCT canonical_country, COUNT(*) as cnt
             FROM processed_profiles
             WHERE canonical_country IS NOT NULL AND canonical_country != ''
+              AND client_id = ?
             GROUP BY canonical_country
             ORDER BY cnt DESC
-        """).fetchall()
+        """, [client_id]).fetchall()
         conn.close()
         return [{"value": row[0], "label": row[0], "count": row[1]} for row in results if row[0]]
     except Exception as e:
@@ -2479,29 +2811,33 @@ async def legacy_get_countries():
 
 
 @app.get("/api/filters/cities")
-async def legacy_get_cities(country: Optional[str] = None):
+async def legacy_get_cities(request: Request, country: Optional[str] = None):
     """Get cities, optionally filtered by country"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
         conn = get_db_connection()
         if country:
             results = conn.execute("""
                 SELECT DISTINCT canonical_city, COUNT(*) as cnt
                 FROM processed_profiles
-                WHERE canonical_country = ? 
-                  AND canonical_city IS NOT NULL 
+                WHERE canonical_country = ?
+                  AND canonical_city IS NOT NULL
                   AND canonical_city != ''
+                  AND client_id = ?
                 GROUP BY canonical_city
                 ORDER BY cnt DESC
-            """, [country]).fetchall()
+            """, [country, client_id]).fetchall()
         else:
             results = conn.execute("""
                 SELECT DISTINCT canonical_city, COUNT(*) as cnt
                 FROM processed_profiles
                 WHERE canonical_city IS NOT NULL AND canonical_city != ''
+                  AND client_id = ?
                 GROUP BY canonical_city
                 ORDER BY cnt DESC
                 LIMIT 200
-            """).fetchall()
+            """, [client_id]).fetchall()
         conn.close()
         return [{"value": row[0], "label": row[0], "count": row[1]} for row in results if row[0]]
     except Exception as e:
@@ -2510,24 +2846,27 @@ async def legacy_get_cities(country: Optional[str] = None):
 
 
 @app.get("/api/filters/locations")
-async def legacy_get_locations():
+async def legacy_get_locations(request: Request):
     """Get all unique locations"""
-    return await legacy_get_cities()
+    return await legacy_get_cities(request)
 
 
 @app.get("/api/filters/industries")
-async def legacy_get_industries():
+async def legacy_get_industries(request: Request):
     """Get all industries"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
         conn = get_db_connection()
         results = conn.execute("""
             SELECT DISTINCT primary_domain, COUNT(*) as cnt
             FROM processed_profiles
             WHERE primary_domain IS NOT NULL AND primary_domain != ''
+              AND client_id = ?
             GROUP BY primary_domain
             ORDER BY cnt DESC
             LIMIT 100
-        """).fetchall()
+        """, [client_id]).fetchall()
         conn.close()
         return [{"value": row[0], "label": row[0], "count": row[1]} for row in results if row[0]]
     except Exception as e:
@@ -2536,19 +2875,22 @@ async def legacy_get_industries():
 
 
 @app.get("/api/filters/roles")
-async def legacy_get_roles():
-    """Get all role titles"""
+async def legacy_get_roles(request: Request):
+    """Get all role titles for this client's candidates"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
         conn = get_db_connection()
-        # Corrected: title -> role_title
         results = conn.execute("""
-            SELECT role_title, COUNT(*) as cnt
-            FROM roles
-            WHERE role_title IS NOT NULL AND role_title != ''
-            GROUP BY role_title
+            SELECT r.role_title, COUNT(*) as cnt
+            FROM roles r
+            INNER JOIN processed_profiles pp ON r.forager_id = pp.person_id
+            WHERE r.role_title IS NOT NULL AND r.role_title != ''
+              AND pp.client_id = ?
+            GROUP BY r.role_title
             ORDER BY cnt DESC
             LIMIT 100
-        """).fetchall()
+        """, [client_id]).fetchall()
         conn.close()
         return [{"value": row[0], "label": row[0], "count": row[1]} for row in results if row[0]]
     except Exception as e:
@@ -2557,18 +2899,22 @@ async def legacy_get_roles():
 
 
 @app.get("/api/filters/schools")
-async def legacy_get_schools():
-    """Get all schools"""
+async def legacy_get_schools(request: Request):
+    """Get all schools for this client's candidates"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
         conn = get_db_connection()
         results = conn.execute("""
-            SELECT school_name, COUNT(*) as cnt
-            FROM educations
-            WHERE school_name IS NOT NULL AND school_name != ''
-            GROUP BY school_name
+            SELECT e.school_name, COUNT(*) as cnt
+            FROM educations e
+            INNER JOIN processed_profiles pp ON e.forager_id = pp.person_id
+            WHERE e.school_name IS NOT NULL AND e.school_name != ''
+              AND pp.client_id = ?
+            GROUP BY e.school_name
             ORDER BY cnt DESC
             LIMIT 100
-        """).fetchall()
+        """, [client_id]).fetchall()
         conn.close()
         return [{"value": row[0], "label": row[0], "count": row[1]} for row in results if row[0]]
     except Exception as e:
@@ -2577,19 +2923,22 @@ async def legacy_get_schools():
 
 
 @app.get("/api/filters/certifications")
-async def legacy_get_certifications():
-    """Get all certifications"""
+async def legacy_get_certifications(request: Request):
+    """Get all certifications for this client's candidates"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
         conn = get_db_connection()
-        # Corrected: certification_name -> certificate_name
         results = conn.execute("""
-            SELECT certificate_name, COUNT(*) as cnt
-            FROM certifications
-            WHERE certificate_name IS NOT NULL AND certificate_name != ''
-            GROUP BY certificate_name
+            SELECT c.certificate_name, COUNT(*) as cnt
+            FROM certifications c
+            INNER JOIN processed_profiles pp ON c.forager_id = pp.person_id
+            WHERE c.certificate_name IS NOT NULL AND c.certificate_name != ''
+              AND pp.client_id = ?
+            GROUP BY c.certificate_name
             ORDER BY cnt DESC
             LIMIT 100
-        """).fetchall()
+        """, [client_id]).fetchall()
         conn.close()
         return [{"value": row[0], "label": row[0], "count": row[1]} for row in results if row[0]]
     except Exception as e:
@@ -2598,18 +2947,21 @@ async def legacy_get_certifications():
 
 
 @app.get("/api/analytics/countries")
-async def legacy_analytics_countries(limit: int = 10):
+async def legacy_analytics_countries(request: Request, limit: int = 10):
     """Get candidate count by country for charts"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
         conn = get_db_connection()
         results = conn.execute("""
             SELECT canonical_country as country, COUNT(*) as count
             FROM processed_profiles
             WHERE canonical_country IS NOT NULL AND canonical_country != ''
+              AND client_id = ?
             GROUP BY canonical_country
             ORDER BY count DESC
             LIMIT ?
-        """, [limit]).fetchall()
+        """, [client_id, limit]).fetchall()
         conn.close()
         return [{"country": row[0], "count": row[1]} for row in results if row[0]]
     except Exception as e:
@@ -2618,18 +2970,21 @@ async def legacy_analytics_countries(limit: int = 10):
 
 
 @app.get("/api/analytics/industries")
-async def legacy_analytics_industries(limit: int = 10):
+async def legacy_analytics_industries(request: Request, limit: int = 10):
     """Get candidate count by industry for charts"""
     try:
+        from client_auth import require_client_id as _req
+        client_id = _req(request)
         conn = get_db_connection()
         results = conn.execute("""
             SELECT primary_domain, COUNT(*) as count
             FROM processed_profiles
             WHERE primary_domain IS NOT NULL AND primary_domain != ''
+              AND client_id = ?
             GROUP BY primary_domain
             ORDER BY count DESC
             LIMIT ?
-        """, [limit]).fetchall()
+        """, [client_id, limit]).fetchall()
         conn.close()
         return [{"industry": row[0], "count": row[1]} for row in results if row[0]]
     except Exception as e:
@@ -2744,6 +3099,21 @@ async def legacy_export_excel(
 ):
     """Export search results to Excel (placeholder)"""
     raise HTTPException(status_code=501, detail="Excel export not yet implemented in v2 API")
+
+
+# =============================================================================
+# INTEGRATION ROUTER  (for the TypeScript mediator backend)
+# POST /api/integration/search  — authenticated via X-Integration-Key header
+# GET  /api/integration/health  — unauthenticated liveness probe
+# =============================================================================
+
+try:
+    from integration_api import router as integration_router
+    app.include_router(integration_router)
+    logger.info("Integration API router loaded: /api/integration/*")
+except Exception as _e:
+    import traceback
+    logger.warning("Integration API not loaded: %s\n%s", _e, traceback.format_exc())
 
 
 # =============================================================================

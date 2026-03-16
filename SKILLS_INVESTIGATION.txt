@@ -1,0 +1,71 @@
+SKILLS INVESTIGATION - March 12, 2026
+======================================
+
+PROBLEM: ~50% of profiles have empty canonical_skills. Was data wiped?
+ANSWER:  NO. Nothing was lost. The original LinkedIn scrapes never had skills for those profiles.
+
+PROOF
+-----
+Main DB (Database/talent_search.duckdb):
+  Total profiles:   253,090
+  With skills:      127,072 (50.2%)
+  Without skills:   126,018 (49.8%)
+  - client 00:  235,702 total | 113,577 with skills (48.2%) | 122,125 without
+  - client 01:  17,388  total | 13,495  with skills (77.6%) | 3,893   without
+
+Japanese source DB (japanese_names.duckdb - raw scrape data):
+  Total profiles:   246,441
+  With skills:      96,855 (39.3%)   <-- SOURCE only has 39% coverage
+  Without skills:   149,586 (60.7%)
+
+Loxo source (data/loxo.jsonl - client 01):
+  Total records:    17,388
+  With skills:      12,123 (69.7%)
+  Without skills:   5,265  (30.3%)
+  Mismatches vs DB: ZERO. Every source skill is intact.
+
+Main DB actually has MORE skills than the raw sources because
+backfill_skills.py enriched ~16,722 additional profiles from title/headline keywords.
+
+HOW MATCHING WORKS WITHOUT SKILLS
+----------------------------------
+The system does NOT rely on skills alone. It uses hybrid search (dense + sparse):
+
+1. DENSE VECTOR (semantic embedding)
+   - Profile text (headline, description, roles, companies) is embedded
+   - Query text is embedded and compared via cosine similarity
+   - Finds candidates even without explicit skills if their profile text is relevant
+   - Example: "Python developer" matches a profile with headline "Sr. Python Dev"
+
+2. SPARSE VECTOR (BM25 keyword matching)
+   - Exact keyword overlap scoring
+   - Limited for skill-less profiles but still catches title/headline matches
+
+3. RANKING BONUSES (post-retrieval scoring):
+   - Skills perfect match:   +0.40
+   - Skills partial match:   +0.25
+   - Title exact match:      +0.20
+   - Company exact match:    +0.25
+   - Location city exact:    +0.15
+   - Education match:        +0.12
+   - Experience fit:         +0.12
+   - Certification match:    +0.06
+   - Multi-signal combo:     +0.15
+
+4. SKILL EXPANSION (relationship graph)
+   - "Python" auto-expands to Django, Flask, FastAPI, Pandas, etc.
+   - Finds candidates who list related skills even if exact skill missing
+
+PROFILES WITHOUT SKILLS CAN STILL BE FOUND IF:
+  - Their headline/title contains relevant keywords (title matching + embedding)
+  - Their work history/description mentions relevant experience (embedding)
+  - Their location/company/education matches (bonus scoring)
+
+PROFILES WITHOUT SKILLS WILL RANK LOWER because they miss the +0.40 skills bonus,
+but they are NOT invisible.
+
+WHAT WAS DONE
+-------------
+- backfill_skills.py was partially run and added title-based skills to ~16,722 profiles
+- Could be run again to cover more profiles with matchable titles (~9,183 still eligible)
+- CSV backups confirm data integrity - nothing was wiped

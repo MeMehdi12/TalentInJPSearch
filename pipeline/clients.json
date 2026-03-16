@@ -1,0 +1,36 @@
+{
+  "_comment": "Client registry for Talentin JPSearch. Add one entry per client here.",
+  "_format": {
+    "client_id": "Unique slug used everywhere \u00e2\u20ac\u201d DuckDB, Qdrant, auth headers",
+    "display_name": "Human-readable name shown in logs / admin UI",
+    "email_domains": "List of email domains whose users see ONLY this client's data",
+    "email_addresses": "Specific emails (overrides domain rule) \u00e2\u20ac\u201d useful for demos / guest users",
+    "password_hash_sha256": "SHA-256 of the shared login password for this client (leave null to share the global password)",
+    "active": "Set false to temporarily disable a client without deleting their data",
+    "notes": "Free-text notes"
+  },
+  "clients": [
+    {
+      "client_id": "00",
+      "display_name": "Talentin (Internal)",
+      "email_domains": [
+        "talentin.ai",
+        "avistatech.net"
+      ],
+      "email_addresses": [],
+      "password_hash_sha256": null,
+      "active": true,
+      "notes": "Default client. All existing pre-migration data belongs here."
+    },
+    {
+      "client_id": "01",
+      "display_name": "Loxo",
+      "email_domains": [
+        "loxo.co"
+      ],
+      "email_addresses": [],
+      "active": true,
+      "notes": ""
+    }
+  ]
+}

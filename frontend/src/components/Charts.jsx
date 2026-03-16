@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import axios from 'axios';
+import { getClientId } from '../auth';
 
 const API_URL = import.meta.env.VITE_API_URL;
 const API_KEY = import.meta.env.VITE_API_KEY;
@@ -172,6 +173,10 @@ export const DashboardCharts = () => {
         headers['X-API-Key'] = API_KEY;
       } else {
         console.warn("VITE_API_KEY is missing. Requests might fail if auth is required.");
+      }
+      const clientId = getClientId();
+      if (clientId) {
+        headers['X-Client-ID'] = clientId;
       }
 
       const [countriesRes, industriesRes] = await Promise.all([

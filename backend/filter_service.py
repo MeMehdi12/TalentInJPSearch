@@ -108,7 +108,8 @@ def _set_cached(key: str, value: Any) -> None:
 def get_skill_facets(
     conn,
     current_filters: Optional[Dict] = None,
-    limit: int = 50
+    limit: int = 50,
+    client_id: Optional[str] = None
 ) -> List[FacetItem]:
     """
     Get top skills with counts, optionally filtered.
@@ -117,11 +118,12 @@ def get_skill_facets(
         conn: DuckDB connection
         current_filters: Active filters to apply
         limit: Max skills to return
+        client_id: Tenant scope — only return skills for this client
     
     Returns:
         List of FacetItem with skill counts
     """
-    cache_key = f"skills:{hash(str(current_filters))}:{limit}"
+    cache_key = f"skills:{client_id}:{hash(str(current_filters))}:{limit}"
     cached = _get_cached(cache_key)
     if cached:
         return cached
@@ -130,6 +132,10 @@ def get_skill_facets(
         # Build WHERE clause based on current filters - USING PARAMETERIZED QUERIES
         where_clauses = []
         params = []
+
+        if client_id:
+            where_clauses.append("p.client_id = ?")
+            params.append(client_id)
         
         if current_filters:
             if current_filters.get("location", {}).get("city"):
@@ -179,15 +185,19 @@ def get_skill_facets(
 def get_location_facets(
     conn,
     current_filters: Optional[Dict] = None,
-    limit: int = 30
+    limit: int = 30,
+    client_id: Optional[str] = None
 ) -> LocationFacets:
-    """Get location facets (cities and countries) with counts"""
-    cache_key = f"locations:{hash(str(current_filters))}:{limit}"
+    """Get location facets (cities and countries) with counts, scoped to client."""
+    cache_key = f"locations:{client_id}:{hash(str(current_filters))}:{limit}"
     cached = _get_cached(cache_key)
     if cached:
         return cached
     
     try:
+        client_clause = "AND client_id = ?" if client_id else ""
+        client_params = [client_id] if client_id else []
+
         # Cities
         city_query = f"""
             SELECT 
@@ -196,11 +206,12 @@ def get_location_facets(
                 COUNT(*) as count
             FROM processed_profiles
             WHERE canonical_city IS NOT NULL AND canonical_city != ''
+            {client_clause}
             GROUP BY canonical_city, canonical_country
             ORDER BY count DESC
             LIMIT {limit}
         """
-        city_results = conn.execute(city_query).fetchall()
+        city_results = conn.execute(city_query, client_params).fetchall()
         
         cities = [
             FacetItem(
@@ -219,11 +230,12 @@ def get_location_facets(
                 COUNT(*) as count
             FROM processed_profiles
             WHERE canonical_country IS NOT NULL AND canonical_country != ''
+            {client_clause}
             GROUP BY canonical_country
             ORDER BY count DESC
             LIMIT {limit}
         """
-        country_results = conn.execute(country_query).fetchall()
+        country_results = conn.execute(country_query, client_params).fetchall()
         
         countries = [
             FacetItem(
@@ -247,15 +259,19 @@ def get_location_facets(
 def get_company_facets(
     conn,
     current_filters: Optional[Dict] = None,
-    limit: int = 30
+    limit: int = 30,
+    client_id: Optional[str] = None
 ) -> List[FacetItem]:
-    """Get top companies with counts"""
-    cache_key = f"companies:{hash(str(current_filters))}:{limit}"
+    """Get top companies with counts, scoped to client."""
+    cache_key = f"companies:{client_id}:{hash(str(current_filters))}:{limit}"
     cached = _get_cached(cache_key)
     if cached:
         return cached
     
     try:
+        client_clause = "AND client_id = ?" if client_id else ""
+        client_params = [client_id] if client_id else []
+
         query = f"""
             SELECT 
                 current_role_company,
@@ -264,11 +280,12 @@ def get_company_facets(
             WHERE current_role_company IS NOT NULL 
               AND current_role_company != ''
               AND current_role_company != 'Unknown'
+            {client_clause}
             GROUP BY current_role_company
             ORDER BY count DESC
             LIMIT {limit}
         """
-        results = conn.execute(query).fetchall()
+        results = conn.execute(query, client_params).fetchall()
         
         facets = [
             FacetItem(
@@ -288,15 +305,18 @@ def get_company_facets(
         return []
 
 
-def get_experience_facets(conn) -> List[ExperienceRange]:
-    """Get experience ranges with counts"""
-    cache_key = "experience_ranges"
+def get_experience_facets(conn, client_id: Optional[str] = None) -> List[ExperienceRange]:
+    """Get experience ranges with counts, scoped to client."""
+    cache_key = f"experience_ranges:{client_id}"
     cached = _get_cached(cache_key)
     if cached:
         return cached
     
     try:
-        query = """
+        client_clause = "AND client_id = ?" if client_id else ""
+        client_params = [client_id] if client_id else []
+
+        query = f"""
             SELECT 
                 CASE 
                     WHEN years_experience <= 2 THEN '0-2'
@@ -307,6 +327,7 @@ def get_experience_facets(conn) -> List[ExperienceRange]:
                 COUNT(*) as count
             FROM processed_profiles
             WHERE years_experience IS NOT NULL
+            {client_clause}
             GROUP BY exp_range
             ORDER BY 
                 CASE exp_range 
@@ -316,7 +337,7 @@ def get_experience_facets(conn) -> List[ExperienceRange]:
                     ELSE 4 
                 END
         """
-        results = conn.execute(query).fetchall()
+        results = conn.execute(query, client_params).fetchall()
         
         labels = {
             "0-2": "0-2 years (Junior)",
@@ -342,25 +363,29 @@ def get_experience_facets(conn) -> List[ExperienceRange]:
         return []
 
 
-def get_domain_facets(conn, limit: int = 20) -> List[FacetItem]:
-    """Get domain facets with counts"""
-    cache_key = f"domains:{limit}"
+def get_domain_facets(conn, limit: int = 20, client_id: Optional[str] = None) -> List[FacetItem]:
+    """Get domain facets with counts, scoped to client."""
+    cache_key = f"domains:{client_id}:{limit}"
     cached = _get_cached(cache_key)
     if cached:
         return cached
     
     try:
+        client_clause = "AND client_id = ?" if client_id else ""
+        client_params = [client_id] if client_id else []
+
         query = f"""
             SELECT 
                 primary_domain,
                 COUNT(*) as count
             FROM processed_profiles
             WHERE primary_domain IS NOT NULL
+            {client_clause}
             GROUP BY primary_domain
             ORDER BY count DESC
             LIMIT {limit}
         """
-        results = conn.execute(query).fetchall()
+        results = conn.execute(query, client_params).fetchall()
         
         facets = [
             FacetItem(
@@ -380,12 +405,13 @@ def get_domain_facets(conn, limit: int = 20) -> List[FacetItem]:
         return []
 
 
-def get_all_facets(current_filters: Optional[Dict] = None) -> FacetsResponse:
+def get_all_facets(current_filters: Optional[Dict] = None, client_id: Optional[str] = None) -> FacetsResponse:
     """
-    Get all facets in one call.
+    Get all facets in one call, scoped to the given client.
     
     Args:
         current_filters: Active filters to apply (affects counts)
+        client_id: Tenant scope — only return facets for this client
     
     Returns:
         FacetsResponse with all facet types
@@ -395,11 +421,11 @@ def get_all_facets(current_filters: Optional[Dict] = None) -> FacetsResponse:
     
     try:
         response = FacetsResponse(
-            skills=get_skill_facets(conn, current_filters),
-            locations=get_location_facets(conn, current_filters),
-            companies=get_company_facets(conn, current_filters),
-            experience_ranges=get_experience_facets(conn),
-            domains=get_domain_facets(conn),
+            skills=get_skill_facets(conn, current_filters, client_id=client_id),
+            locations=get_location_facets(conn, current_filters, client_id=client_id),
+            companies=get_company_facets(conn, current_filters, client_id=client_id),
+            experience_ranges=get_experience_facets(conn, client_id=client_id),
+            domains=get_domain_facets(conn, client_id=client_id),
             took_ms=int((time.time() - start_time) * 1000)
         )
         
@@ -414,8 +440,8 @@ def get_all_facets(current_filters: Optional[Dict] = None) -> FacetsResponse:
 # AUTOCOMPLETE SERVICE
 # =============================================================================
 
-def autocomplete_skills(query: str, limit: int = 10) -> AutocompleteResponse:
-    """Autocomplete for skills field"""
+def autocomplete_skills(query: str, limit: int = 10, client_id: Optional[str] = None) -> AutocompleteResponse:
+    """Autocomplete for skills field, scoped to client."""
     start_time = time.time()
     conn = get_db_connection()
     
@@ -423,17 +449,32 @@ def autocomplete_skills(query: str, limit: int = 10) -> AutocompleteResponse:
         # Use LIKE for prefix matching
         query_pattern = f"{query.lower()}%"
         
-        sql = f"""
-            SELECT 
-                skills as skill,
-                COUNT(*) as count
-            FROM skills
-            WHERE LOWER(skills) LIKE ?
-            GROUP BY skills
-            ORDER BY count DESC
-            LIMIT {limit}
-        """
-        results = conn.execute(sql, [query_pattern]).fetchall()
+        if client_id:
+            sql = f"""
+                SELECT 
+                    s.skills as skill,
+                    COUNT(*) as count
+                FROM skills s
+                INNER JOIN processed_profiles p ON s.forager_id = p.person_id
+                WHERE LOWER(s.skills) LIKE ?
+                  AND p.client_id = ?
+                GROUP BY s.skills
+                ORDER BY count DESC
+                LIMIT {limit}
+            """
+            results = conn.execute(sql, [query_pattern, client_id]).fetchall()
+        else:
+            sql = f"""
+                SELECT 
+                    skills as skill,
+                    COUNT(*) as count
+                FROM skills
+                WHERE LOWER(skills) LIKE ?
+                GROUP BY skills
+                ORDER BY count DESC
+                LIMIT {limit}
+            """
+            results = conn.execute(sql, [query_pattern]).fetchall()
         
         suggestions = [
             FacetItem(
@@ -453,14 +494,16 @@ def autocomplete_skills(query: str, limit: int = 10) -> AutocompleteResponse:
         conn.close()
 
 
-def autocomplete_companies(query: str, limit: int = 10) -> AutocompleteResponse:
-    """Autocomplete for companies field"""
+def autocomplete_companies(query: str, limit: int = 10, client_id: Optional[str] = None) -> AutocompleteResponse:
+    """Autocomplete for companies field, scoped to client."""
     start_time = time.time()
     conn = get_db_connection()
     
     try:
         query_pattern = f"%{query.lower()}%"
-        
+        client_clause = "AND client_id = ?" if client_id else ""
+        params = [query_pattern] + ([client_id] if client_id else [])
+
         sql = f"""
             SELECT 
                 current_role_company,
@@ -469,11 +512,12 @@ def autocomplete_companies(query: str, limit: int = 10) -> AutocompleteResponse:
             WHERE LOWER(current_role_company) LIKE ?
               AND current_role_company IS NOT NULL
               AND current_role_company != ''
+            {client_clause}
             GROUP BY current_role_company
             ORDER BY count DESC
             LIMIT {limit}
         """
-        results = conn.execute(sql, [query_pattern]).fetchall()
+        results = conn.execute(sql, params).fetchall()
         
         suggestions = [
             FacetItem(
@@ -493,14 +537,16 @@ def autocomplete_companies(query: str, limit: int = 10) -> AutocompleteResponse:
         conn.close()
 
 
-def autocomplete_locations(query: str, limit: int = 10) -> AutocompleteResponse:
-    """Autocomplete for locations (cities)"""
+def autocomplete_locations(query: str, limit: int = 10, client_id: Optional[str] = None) -> AutocompleteResponse:
+    """Autocomplete for locations (cities), scoped to client."""
     start_time = time.time()
     conn = get_db_connection()
     
     try:
         query_pattern = f"%{query.lower()}%"
-        
+        client_clause = "AND client_id = ?" if client_id else ""
+        params = [query_pattern] + ([client_id] if client_id else [])
+
         sql = f"""
             SELECT 
                 canonical_city,
@@ -510,11 +556,12 @@ def autocomplete_locations(query: str, limit: int = 10) -> AutocompleteResponse:
             WHERE LOWER(canonical_city) LIKE ?
               AND canonical_city IS NOT NULL
               AND canonical_city != ''
+            {client_clause}
             GROUP BY canonical_city, canonical_country
             ORDER BY count DESC
             LIMIT {limit}
         """
-        results = conn.execute(sql, [query_pattern]).fetchall()
+        results = conn.execute(sql, params).fetchall()
         
         suggestions = [
             FacetItem(
@@ -534,14 +581,16 @@ def autocomplete_locations(query: str, limit: int = 10) -> AutocompleteResponse:
         conn.close()
 
 
-def autocomplete_titles(query: str, limit: int = 10) -> AutocompleteResponse:
-    """Autocomplete for job titles"""
+def autocomplete_titles(query: str, limit: int = 10, client_id: Optional[str] = None) -> AutocompleteResponse:
+    """Autocomplete for job titles, scoped to client."""
     start_time = time.time()
     conn = get_db_connection()
     
     try:
         query_pattern = f"%{query.lower()}%"
-        
+        client_clause = "AND client_id = ?" if client_id else ""
+        params = [query_pattern] + ([client_id] if client_id else [])
+
         sql = f"""
             SELECT 
                 current_role_title,
@@ -550,11 +599,12 @@ def autocomplete_titles(query: str, limit: int = 10) -> AutocompleteResponse:
             WHERE LOWER(current_role_title) LIKE ?
               AND current_role_title IS NOT NULL
               AND current_role_title != ''
+            {client_clause}
             GROUP BY current_role_title
             ORDER BY count DESC
             LIMIT {limit}
         """
-        results = conn.execute(sql, [query_pattern]).fetchall()
+        results = conn.execute(sql, params).fetchall()
         
         suggestions = [
             FacetItem(
@@ -574,14 +624,15 @@ def autocomplete_titles(query: str, limit: int = 10) -> AutocompleteResponse:
         conn.close()
 
 
-def autocomplete(field: str, query: str, limit: int = 10) -> AutocompleteResponse:
+def autocomplete(field: str, query: str, limit: int = 10, client_id: Optional[str] = None) -> AutocompleteResponse:
     """
-    Unified autocomplete handler.
+    Unified autocomplete handler, scoped to client.
     
     Args:
         field: Field to autocomplete (skills, companies, locations, titles)
         query: Search prefix
         limit: Max suggestions
+        client_id: Tenant scope
     
     Returns:
         AutocompleteResponse with suggestions
@@ -598,16 +649,16 @@ def autocomplete(field: str, query: str, limit: int = 10) -> AutocompleteRespons
         logger.warning(f"Unknown autocomplete field: {field}")
         return AutocompleteResponse()
     
-    return handler(query, limit)
+    return handler(query, limit, client_id=client_id)
 
 
 # =============================================================================
 # FILTER METADATA SERVICE
 # =============================================================================
 
-def get_filter_metadata() -> FilterMetadataResponse:
+def get_filter_metadata(client_id: Optional[str] = None) -> FilterMetadataResponse:
     """
-    Get metadata about available filters.
+    Get metadata about available filters, scoped to the given client.
     
     Returns counts, ranges, and top values for all filterable fields.
     """
@@ -615,45 +666,62 @@ def get_filter_metadata() -> FilterMetadataResponse:
     conn = get_db_connection()
     
     try:
+        client_clause = "AND client_id = ?" if client_id else ""
+        client_clause_where = "WHERE client_id = ?" if client_id else ""
+        p = [client_id] if client_id else []
+
         # Total profiles
-        total = conn.execute("SELECT COUNT(*) FROM processed_profiles").fetchone()[0]
-        
-        # Skills metadata
-        skills_count = conn.execute(
-            "SELECT COUNT(DISTINCT skills) FROM skills"
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM processed_profiles {client_clause_where}", p
         ).fetchone()[0]
         
-        top_skills = conn.execute("""
-            SELECT skills as skill, COUNT(*) as count
-            FROM skills
-            GROUP BY skills
-            ORDER BY count DESC
-            LIMIT 10
-        """).fetchall()
+        # Skills metadata
+        if client_id:
+            skills_count = conn.execute(
+                "SELECT COUNT(DISTINCT s.skills) FROM skills s "
+                "INNER JOIN processed_profiles pp ON s.forager_id = pp.person_id "
+                "WHERE pp.client_id = ?", p
+            ).fetchone()[0]
+            top_skills = conn.execute("""
+                SELECT s.skills as skill, COUNT(*) as count
+                FROM skills s
+                INNER JOIN processed_profiles pp ON s.forager_id = pp.person_id
+                WHERE pp.client_id = ?
+                GROUP BY s.skills
+                ORDER BY count DESC
+                LIMIT 10
+            """, p).fetchall()
+        else:
+            skills_count = conn.execute(
+                "SELECT COUNT(DISTINCT skills) FROM skills"
+            ).fetchone()[0]
+            top_skills = conn.execute("""
+                SELECT skills as skill, COUNT(*) as count
+                FROM skills
+                GROUP BY skills
+                ORDER BY count DESC
+                LIMIT 10
+            """).fetchall()
         
         # Location metadata
         cities_count = conn.execute(
-            "SELECT COUNT(DISTINCT canonical_city) FROM processed_profiles WHERE canonical_city IS NOT NULL"
+            f"SELECT COUNT(DISTINCT canonical_city) FROM processed_profiles WHERE canonical_city IS NOT NULL {client_clause}", p
         ).fetchone()[0]
         
         countries_count = conn.execute(
-            "SELECT COUNT(DISTINCT canonical_country) FROM processed_profiles WHERE canonical_country IS NOT NULL"
+            f"SELECT COUNT(DISTINCT canonical_country) FROM processed_profiles WHERE canonical_country IS NOT NULL {client_clause}", p
         ).fetchone()[0]
         
         # Company metadata
         companies_count = conn.execute(
-            "SELECT COUNT(DISTINCT current_role_company) FROM processed_profiles WHERE current_role_company IS NOT NULL"
+            f"SELECT COUNT(DISTINCT current_role_company) FROM processed_profiles WHERE current_role_company IS NOT NULL {client_clause}", p
         ).fetchone()[0]
         
         # Experience metadata
-        exp_stats = conn.execute("""
-            SELECT 
-                MIN(years_experience),
-                MAX(years_experience),
-                AVG(years_experience)
-            FROM processed_profiles
-            WHERE years_experience IS NOT NULL
-        """).fetchone()
+        exp_stats = conn.execute(
+            f"SELECT MIN(years_experience), MAX(years_experience), AVG(years_experience) "
+            f"FROM processed_profiles WHERE years_experience IS NOT NULL {client_clause}", p
+        ).fetchone()
         
         return FilterMetadataResponse(
             total_profiles=total,

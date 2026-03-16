@@ -181,7 +181,7 @@ SKILL_ALIASES: Dict[str, Set[str]] = {
     "fastapi": {"fastapi", "fast api"},
     "spring": {"spring", "spring boot", "springboot"},
     "rails": {"rails", "ruby on rails", "ror"},
-    "nextjs": {"nextjs", "next.js", "next js"},
+    "nextjs": {"nextjs", "next.js", "next js", "next"},
     "express": {"express", "expressjs", "express.js"},
     "node": {"node", "nodejs", "node.js", "node js"},
     
