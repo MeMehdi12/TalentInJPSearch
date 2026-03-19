@@ -1917,15 +1917,34 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
     if location_preference == "must_match" and target_location:
         # MUST MATCH: Hard post-filter on DuckDB hydrated city/location
         before = len(results)
-        results = [
-            r for r in results
-            if target_location in (r.city or "").lower()
-            or target_location in (getattr(r, 'location', '') or "").lower()
-            or target_location in (r.country or "").lower()
-            or target_location in (getattr(r, 'state', '') or "").lower()
-            or target_location in (getattr(r, 'linkedin_area', '') or "").lower()
-            or target_location in (getattr(r, 'area', '') or "").lower()
-        ]
+        
+        def _location_match_tier(r):
+            """Return tier for sorting: 0=exact city, 1=state, 2=country, 3=area/other"""
+            if target_city and target_city.lower() == (r.city or '').lower():
+                return 0  # Exact city match — highest priority
+            if target_city and target_city.lower() in (r.city or '').lower():
+                return 0
+            if target_state and target_state.lower() == (getattr(r, 'state', '') or '').lower():
+                return 1  # State match
+            if target_country and target_country.lower() == (r.country or '').lower():
+                return 2  # Country match
+            return 3  # Fallback (area/linkedin_area substring match)
+        
+        filtered_results = []
+        for r in results:
+            if (target_location in (r.city or "").lower()
+                or target_location in (getattr(r, 'location', '') or "").lower()
+                or target_location in (r.country or "").lower()
+                or target_location in (getattr(r, 'state', '') or "").lower()
+                or target_location in (getattr(r, 'linkedin_area', '') or "").lower()
+                or target_location in (getattr(r, 'area', '') or "").lower()):
+                filtered_results.append(r)
+        
+        # Two-tier sort: group by location tier first, then by score within each tier
+        # This ensures all exact-city matches come first (sorted by score),
+        # then state matches, then country matches — no interleaving.
+        filtered_results.sort(key=lambda r: (_location_match_tier(r), -r.score))
+        results = filtered_results
         logger.info(f"MUST_MATCH: {before} → {len(results)} (location: {target_location})")
     elif location_preference == "remote":
         # REMOTE: No location filtering at all — show everyone
@@ -2036,6 +2055,7 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         bonus_details = []
         all_matched_skills = []
         location_matched = False
+        title_matched = False
         exp_matched = False
         
         # ── 1. SKILLS MATCH ──────────────────────────────────────────
@@ -2092,8 +2112,8 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         # 1d. RELEVANCE PENALTY — demote profiles with zero skill relevance
         if target_skills and not all_matched_skills:
             # Profile matched NONE of the requested skills (array, text, or expanded)
-            bonus -= 0.15
-            bonus_details.append("no_skills-0.15")
+            bonus -= 0.25
+            bonus_details.append("no_skills-0.25")
         
         # 1e. EMPTY PROFILE PENALTY — demote profiles with no useful data
         has_headline = bool(result.headline and result.headline.strip() and result.headline.strip() != '--')
@@ -2102,8 +2122,38 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         
         if target_skills and not has_skills and not has_summary:
             # Profile has no skills AND no meaningful summary — very likely irrelevant
-            bonus -= 0.10
-            bonus_details.append("empty_profile-0.10")
+            bonus -= 0.15
+            bonus_details.append("empty_profile-0.15")
+        
+        # 1f. TITLE/HEADLINE RELEVANCE PENALTY — demote profiles whose title/headline
+        # are obviously unrelated to the query (e.g. "Piano Teacher" for a "react" search)
+        if target_skills and not all_matched_skills and not title_matched:
+            import re as _re2
+            profile_blob = ' '.join([
+                (result.headline or ''),
+                (result.current_title or ''),
+                (result.description or ''),
+                ' '.join(s for s in (result.skills or [])),
+            ]).lower()
+            # Check if ANY target skill keyword appears anywhere in profile text
+            has_any_relevance = False
+            for skill in target_skills:
+                if len(skill) <= 2:
+                    if _re2.search(r'\b' + _re2.escape(skill) + r'\b', profile_blob):
+                        has_any_relevance = True
+                        break
+                else:
+                    if skill in profile_blob:
+                        has_any_relevance = True
+                        break
+            # Also check title keywords from the query
+            if not has_any_relevance and title_keywords:
+                profile_title_words = set(profile_blob.split())
+                if title_keywords & profile_title_words:
+                    has_any_relevance = True
+            if not has_any_relevance:
+                bonus -= 0.12
+                bonus_details.append("no_relevance-0.12")
         
         # ── 2. LOCATION MATCH ────────────────────────────────────────
         location_matched = False
@@ -3114,6 +3164,440 @@ try:
 except Exception as _e:
     import traceback
     logger.warning("Integration API not loaded: %s\n%s", _e, traceback.format_exc())
+
+
+# =============================================================================
+# SEARCH QUALITY TEST ENDPOINTS
+# =============================================================================
+# Diagnostic endpoints to verify search ranking, relevance, and location modes.
+# Each test runs a real smart-search and checks assertions on the results.
+# Call GET /api/v2/test/all to run EVERY test, or individual tests below.
+
+from pydantic import BaseModel as _TestBaseModel
+
+class TestResult(_TestBaseModel):
+    """Result of a single test case"""
+    test_name: str
+    passed: bool
+    message: str
+    details: Optional[Dict] = None
+
+class TestSuiteResult(_TestBaseModel):
+    """Result of the full test suite"""
+    total: int
+    passed: int
+    failed: int
+    results: List[TestResult]
+    took_ms: int
+
+
+async def _run_smart_search_for_test(
+    query: str,
+    location_preference: str = "preferred",
+    limit: int = 20,
+    http_request: Optional[Request] = None,
+) -> SmartSearchResponse:
+    """Helper: run a smart search internally for testing."""
+    req = SmartSearchQuery(query=query, limit=limit, location_preference=location_preference)
+    return await smart_search_endpoint(req, http_request)
+
+
+@app.get("/api/v2/test/relevance", response_model=TestResult)
+async def test_relevance(request: Request, query: str = "react developer"):
+    """
+    TEST: Skill relevance — search for a skill and verify top results actually mention it.
+    
+    Example: GET /api/v2/test/relevance?query=react+developer
+    
+    Checks:
+    - Top 10 results should mostly mention the skill in their skills/headline/title
+    - Irrelevant profiles (Piano Teacher, Stylist, etc.) should NOT be in top 10
+    """
+    try:
+        response = await _run_smart_search_for_test(query, http_request=request)
+        top10 = response.results[:10]
+        
+        # Extract the primary skill keyword from the query
+        query_words = set(w.lower() for w in query.split() if len(w) > 2 and w.lower() not in {
+            'developer', 'engineer', 'manager', 'senior', 'junior', 'lead', 'with', 'the', 'and'
+        })
+        
+        relevant_count = 0
+        irrelevant = []
+        for r in top10:
+            profile_text = ' '.join([
+                (r.headline or ''), (r.current_title or ''),
+                ' '.join(r.skills or []), (r.description or '')[:200]
+            ]).lower()
+            
+            has_relevance = any(kw in profile_text for kw in query_words)
+            if has_relevance:
+                relevant_count += 1
+            else:
+                irrelevant.append({
+                    "name": r.full_name,
+                    "title": r.current_title,
+                    "headline": (r.headline or "")[:60],
+                    "score": r.score,
+                    "skills": (r.skills or [])[:5],
+                })
+        
+        passed = relevant_count >= 7  # At least 7/10 should be relevant
+        return TestResult(
+            test_name=f"Relevance: '{query}'",
+            passed=passed,
+            message=f"{relevant_count}/10 top results are relevant" + (
+                f". Irrelevant profiles found in top 10: {len(irrelevant)}" if irrelevant else ""
+            ),
+            details={
+                "relevant_count": relevant_count,
+                "total_checked": len(top10),
+                "query_keywords": list(query_words),
+                "irrelevant_in_top10": irrelevant,
+                "total_results": response.total_matches,
+            }
+        )
+    except Exception as e:
+        return TestResult(test_name=f"Relevance: '{query}'", passed=False, message=f"Error: {str(e)}")
+
+
+@app.get("/api/v2/test/location-must-match", response_model=TestResult)
+async def test_location_must_match(request: Request, query: str = "software engineer", city: str = "Tokyo"):
+    """
+    TEST: Location must_match — verify ALL top K results are from the target city,
+    with no interleaving from other cities.
+    
+    Example: GET /api/v2/test/location-must-match?query=software+engineer&city=Tokyo
+    """
+    try:
+        full_query = f"{query} in {city}"
+        response = await _run_smart_search_for_test(full_query, location_preference="must_match", http_request=request)
+        top20 = response.results[:20]
+        
+        city_lower = city.lower()
+        matching = []
+        non_matching = []
+        for r in top20:
+            r_city = (r.city or "").lower()
+            r_loc = (getattr(r, 'location', '') or "").lower()
+            r_area = (getattr(r, 'area', '') or "").lower()
+            if city_lower in r_city or city_lower in r_loc or city_lower in r_area:
+                matching.append(r.full_name)
+            else:
+                non_matching.append({
+                    "name": r.full_name,
+                    "city": r.city,
+                    "location": getattr(r, 'location', ''),
+                    "score": r.score,
+                })
+        
+        # Check for contiguous grouping: no non-matching should appear before matching
+        all_match = len(non_matching) == 0
+        passed = all_match
+        
+        return TestResult(
+            test_name=f"Location Must-Match: '{city}'",
+            passed=passed,
+            message=f"{len(matching)}/{len(top20)} results match city '{city}'" + (
+                f". Non-matching profiles found: {len(non_matching)}" if non_matching else " — all matched!"
+            ),
+            details={
+                "matching_count": len(matching),
+                "non_matching": non_matching,
+                "total_results": response.total_matches,
+            }
+        )
+    except Exception as e:
+        return TestResult(test_name=f"Location Must-Match: '{city}'", passed=False, message=f"Error: {str(e)}")
+
+
+@app.get("/api/v2/test/location-grouping", response_model=TestResult)
+async def test_location_grouping(request: Request, query: str = "developer", city: str = "Mumbai"):
+    """
+    TEST: Location grouping — verify results are contiguously grouped by location tier
+    (no interleaving: all city-matched results come first, then state, then country).
+    
+    Example: GET /api/v2/test/location-grouping?query=developer&city=Mumbai
+    """
+    try:
+        full_query = f"{query} in {city}"
+        response = await _run_smart_search_for_test(full_query, location_preference="must_match", http_request=request)
+        top20 = response.results[:20]
+        
+        city_lower = city.lower()
+        
+        # Assign tier to each result
+        tiers = []
+        for r in top20:
+            r_city = (r.city or "").lower()
+            if r_city == city_lower:
+                tiers.append(0)
+            elif city_lower in r_city:
+                tiers.append(0)
+            elif city_lower in (r.state or "").lower():
+                tiers.append(1)
+            elif city_lower in (r.country or "").lower():
+                tiers.append(2)
+            else:
+                tiers.append(3)
+        
+        # Check that tiers are non-decreasing (contiguous grouping)
+        is_contiguous = all(tiers[i] <= tiers[i+1] for i in range(len(tiers)-1)) if len(tiers) > 1 else True
+        
+        return TestResult(
+            test_name=f"Location Grouping: '{city}'",
+            passed=is_contiguous,
+            message=f"{'Tiers are contiguous ✅' if is_contiguous else 'Tiers are interleaved ❌'}. Tier sequence: {tiers[:20]}",
+            details={
+                "tier_sequence": tiers,
+                "results": [
+                    {"name": r.full_name, "city": r.city, "score": r.score, "tier": t}
+                    for r, t in zip(top20, tiers)
+                ]
+            }
+        )
+    except Exception as e:
+        return TestResult(test_name=f"Location Grouping: '{city}'", passed=False, message=f"Error: {str(e)}")
+
+
+@app.get("/api/v2/test/empty-profiles", response_model=TestResult)
+async def test_empty_profiles(request: Request, query: str = "python developer"):
+    """
+    TEST: Empty profiles — verify profiles with no skills AND no summary
+    are NOT in the top 10.
+    
+    Example: GET /api/v2/test/empty-profiles?query=python+developer
+    """
+    try:
+        response = await _run_smart_search_for_test(query, http_request=request)
+        top10 = response.results[:10]
+        
+        empty_in_top10 = []
+        for r in top10:
+            has_skills = bool(r.skills and len(r.skills) > 0)
+            has_summary = bool(r.description and len((r.description or "").strip()) > 20)
+            has_headline = bool(r.headline and r.headline.strip() and r.headline.strip() != '--')
+            
+            if not has_skills and not has_summary and not has_headline:
+                empty_in_top10.append({
+                    "name": r.full_name,
+                    "score": r.score,
+                    "skills_count": len(r.skills or []),
+                    "headline": r.headline,
+                })
+        
+        passed = len(empty_in_top10) == 0
+        return TestResult(
+            test_name=f"Empty Profile Demotion: '{query}'",
+            passed=passed,
+            message=f"{'No' if passed else len(empty_in_top10)} empty profiles in top 10" + (
+                f" — {[e['name'] for e in empty_in_top10]}" if empty_in_top10 else " ✅"
+            ),
+            details={
+                "empty_profiles_in_top10": empty_in_top10,
+                "total_results": response.total_matches,
+            }
+        )
+    except Exception as e:
+        return TestResult(test_name=f"Empty Profile Demotion: '{query}'", passed=False, message=f"Error: {str(e)}")
+
+
+@app.get("/api/v2/test/skill-match", response_model=TestResult)
+async def test_skill_match(request: Request, query: str = "react"):
+    """
+    TEST: Skill matching — verify top results have the queried skill in their profile.
+    
+    Example: GET /api/v2/test/skill-match?query=react
+    """
+    try:
+        response = await _run_smart_search_for_test(query, http_request=request)
+        top10 = response.results[:10]
+        
+        skill_lower = query.lower().strip()
+        matched = []
+        unmatched = []
+        
+        for r in top10:
+            profile_skills = [s.lower() for s in (r.skills or [])]
+            profile_text = ' '.join([
+                (r.headline or ''), (r.current_title or ''),
+                (r.description or '')[:200],
+            ]).lower()
+            
+            has_skill = (
+                skill_lower in profile_skills
+                or any(skill_lower in s for s in profile_skills)
+                or skill_lower in profile_text
+            )
+            
+            if has_skill:
+                matched.append(r.full_name)
+            else:
+                unmatched.append({
+                    "name": r.full_name,
+                    "title": r.current_title,
+                    "headline": (r.headline or "")[:60],
+                    "skills": (r.skills or [])[:5],
+                    "score": r.score,
+                })
+        
+        passed = len(matched) >= 7  # At least 7/10 should mention the skill
+        return TestResult(
+            test_name=f"Skill Match: '{query}'",
+            passed=passed,
+            message=f"{len(matched)}/10 top results mention '{skill_lower}'" + (
+                f". Unmatched: {[u['name'] for u in unmatched]}" if unmatched else " ✅"
+            ),
+            details={
+                "matched_count": len(matched),
+                "unmatched": unmatched,
+                "total_results": response.total_matches,
+            }
+        )
+    except Exception as e:
+        return TestResult(test_name=f"Skill Match: '{query}'", passed=False, message=f"Error: {str(e)}")
+
+
+@app.get("/api/v2/test/title-match", response_model=TestResult)
+async def test_title_match(request: Request, query: str = "software engineer"):
+    """
+    TEST: Title matching — verify top results have relevant job titles.
+    
+    Example: GET /api/v2/test/title-match?query=software+engineer
+    """
+    try:
+        response = await _run_smart_search_for_test(query, http_request=request)
+        top10 = response.results[:10]
+        
+        query_words = set(w.lower() for w in query.split() if len(w) > 2)
+        
+        title_matched = 0
+        unmatched_titles = []
+        for r in top10:
+            title = (r.current_title or "").lower()
+            headline = (r.headline or "").lower()
+            
+            title_words = set(title.split() + headline.split())
+            overlap = query_words & title_words
+            
+            if len(overlap) >= len(query_words) * 0.5:  # At least half the words
+                title_matched += 1
+            else:
+                unmatched_titles.append({
+                    "name": r.full_name,
+                    "title": r.current_title,
+                    "headline": (r.headline or "")[:60],
+                    "score": r.score,
+                })
+        
+        passed = title_matched >= 5  # At least 5/10 should have matching titles
+        return TestResult(
+            test_name=f"Title Match: '{query}'",
+            passed=passed,
+            message=f"{title_matched}/10 top results have matching titles" + (
+                f". Unmatched: {len(unmatched_titles)}" if unmatched_titles else " ✅"
+            ),
+            details={
+                "title_matched": title_matched,
+                "query_words": list(query_words),
+                "unmatched_titles": unmatched_titles[:5],
+                "total_results": response.total_matches,
+            }
+        )
+    except Exception as e:
+        return TestResult(test_name=f"Title Match: '{query}'", passed=False, message=f"Error: {str(e)}")
+
+
+@app.get("/api/v2/test/score-sanity", response_model=TestResult)
+async def test_score_sanity(request: Request, query: str = "data scientist"):
+    """
+    TEST: Score sanity — verify scores are properly ordered and within [0, 1].
+    
+    Example: GET /api/v2/test/score-sanity?query=data+scientist
+    """
+    try:
+        response = await _run_smart_search_for_test(query, http_request=request)
+        results = response.results
+        
+        issues = []
+        
+        # Check all scores in [0, 1]
+        for r in results:
+            if r.score < 0 or r.score > 1:
+                issues.append(f"{r.full_name}: score={r.score} out of [0,1]")
+        
+        # Check descending order
+        for i in range(len(results) - 1):
+            if results[i].score < results[i+1].score:
+                issues.append(
+                    f"Score not descending at position {i}: "
+                    f"{results[i].full_name}={results[i].score:.4f} < "
+                    f"{results[i+1].full_name}={results[i+1].score:.4f}"
+                )
+        
+        passed = len(issues) == 0
+        return TestResult(
+            test_name=f"Score Sanity: '{query}'",
+            passed=passed,
+            message=f"{'All scores valid ✅' if passed else f'{len(issues)} issues found ❌'}",
+            details={
+                "issues": issues[:10],
+                "score_range": [results[0].score, results[-1].score] if results else [],
+                "total_results": len(results),
+            }
+        )
+    except Exception as e:
+        return TestResult(test_name=f"Score Sanity: '{query}'", passed=False, message=f"Error: {str(e)}")
+
+
+@app.get("/api/v2/test/all", response_model=TestSuiteResult)
+async def test_all(request: Request):
+    """
+    🧪 RUN ALL SEARCH QUALITY TESTS
+    
+    Runs the full test suite and returns a summary.
+    Each test exercises a different aspect of search relevance and ranking.
+    
+    GET /api/v2/test/all
+    """
+    start_time = time.time()
+    results = []
+    
+    # Test 1: Skill relevance for "react"
+    results.append(await test_relevance(request, query="react developer"))
+    
+    # Test 2: Skill relevance for "python"
+    results.append(await test_relevance(request, query="python"))
+    
+    # Test 3: Skill match for "react"
+    results.append(await test_skill_match(request, query="react"))
+    
+    # Test 4: Empty profiles demoted
+    results.append(await test_empty_profiles(request, query="machine learning engineer"))
+    
+    # Test 5: Title matching
+    results.append(await test_title_match(request, query="software engineer"))
+    
+    # Test 6: Score sanity
+    results.append(await test_score_sanity(request, query="data scientist"))
+    
+    # Test 7: Location must-match (use a common city)
+    results.append(await test_location_must_match(request, query="developer", city="Tokyo"))
+    
+    # Test 8: Location grouping
+    results.append(await test_location_grouping(request, query="engineer", city="Mumbai"))
+    
+    passed = sum(1 for r in results if r.passed)
+    failed = len(results) - passed
+    took_ms = int((time.time() - start_time) * 1000)
+    
+    return TestSuiteResult(
+        total=len(results),
+        passed=passed,
+        failed=failed,
+        results=results,
+        took_ms=took_ms,
+    )
 
 
 # =============================================================================

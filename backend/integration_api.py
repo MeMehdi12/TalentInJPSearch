@@ -783,6 +783,57 @@ async def integration_search(body: IntegrationSearchRequest, request: Request):
         search_result.results, smart_filters, body.location_preference
     )
 
+    # ── 4a. Location grouping — group exact-location matches at the top ──────────
+    # Applies in both "preferred" and "must_match" modes (not "remote").
+    # Within each tier, candidates are sorted by score (highest first).
+    # Tier 0 = exact city match, Tier 1 = state match, Tier 2 = country match, Tier 3 = other.
+    #
+    # RELEVANCE FLOOR: Profiles with score < 0.30 are NOT promoted by location.
+    # This prevents irrelevant profiles (e.g. "Inspector" for a "nodejs developer"
+    # search) from appearing at the top just because they're in the right city.
+    _LOCATION_TIER_MIN_SCORE = 0.30
+
+    if body.location_preference != "remote" and (original_city or original_state or original_country):
+        _loc_city = (original_city or "").lower()
+        _loc_state = (original_state or "").lower()
+        _loc_country = (original_country or "").lower()
+
+        def _integration_location_tier(r):
+            """Return tier for grouping: 0=exact city, 1=state, 2=country, 3=other.
+            Profiles below the relevance floor stay in tier 3 regardless of location."""
+            # Relevance floor: don't promote irrelevant profiles
+            if r.score < _LOCATION_TIER_MIN_SCORE:
+                return 3
+
+            r_city = (r.city or "").lower()
+            r_state = (getattr(r, "state", "") or "").lower()
+            r_country = (r.country or "").lower()
+            r_location = (getattr(r, "location", "") or "").lower()
+            r_area = (getattr(r, "area", "") or "").lower()
+            r_linkedin_area = (getattr(r, "linkedin_area", "") or "").lower()
+
+            # Tier 0: exact city match (multiple field checks)
+            if _loc_city:
+                if _loc_city == r_city or _loc_city in r_city:
+                    return 0
+                if _loc_city in r_location or _loc_city in r_area or _loc_city in r_linkedin_area:
+                    return 0
+            # Tier 1: state match
+            if _loc_state:
+                if _loc_state == r_state or _loc_state in r_location:
+                    return 1
+            # Tier 2: country match
+            if _loc_country:
+                if _loc_country == r_country or _loc_country in r_location:
+                    return 2
+            return 3
+
+        reranked.sort(key=lambda r: (_integration_location_tier(r), -r.score))
+        logger.info("Location grouping applied (min_score=%.2f): city='%s', state='%s', country='%s' — "
+                     "tier counts: %s",
+                     _LOCATION_TIER_MIN_SCORE, _loc_city, _loc_state, _loc_country,
+                     {t: sum(1 for r in reranked if _integration_location_tier(r) == t) for t in range(4)})
+
     # ── 4b. Experience post-filter — catch profiles with null/stale Qdrant data ──
     if exp.min_years is not None or exp.max_years is not None:
         before_exp = len(reranked)
