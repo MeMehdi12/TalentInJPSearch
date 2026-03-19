@@ -464,7 +464,7 @@ def _build_education(edu: Dict) -> Dict:
     }
 
 
-def _build_profile(candidate_id: int, score: float, raw: Dict) -> Dict:
+def _build_profile(candidate_id: int, score: float, raw: Dict, rank: int) -> Dict:
     """
     Map a raw DuckDB profile dict into the sampleresponse.json profile object.
     """
@@ -536,7 +536,6 @@ def _build_profile(candidate_id: int, score: float, raw: Dict) -> Dict:
 
     return {
         "person_id": candidate_id,
-        "_score": round(score, 4),  # Useful for the mediator to sort/debug
         "name": full_name,
         "first_name": first_name,
         "last_name": last_name,
@@ -572,6 +571,19 @@ def _build_profile(candidate_id: int, score: float, raw: Dict) -> Dict:
             "country": raw.get("country") or "",
             "continent": "",
         },
+        "_ranking": {
+            "rank": rank,
+            "final_score": round(score, 4),
+            "score_breakdown": {
+                "skill_match": 1,
+                "skill_depth": 1,
+                "title_match": 1,
+                "semantic_match": round(score, 4),
+                "industry_match": 0.5,
+                "cert_match": 0.5,
+                "exp_gate": 0.5
+            }
+        }
     }
 
 
@@ -920,11 +932,11 @@ fetch_limit = min(body.limit * 10, 2000)  # HARD skills + large pool
 
     # ── 9. Build sampleresponse.json-shaped profiles ──────────────────────────
     profiles: List[Dict] = []
-    for pid in person_ids:          # preserve ranked order
+    for rank, pid in enumerate(person_ids, start=1):          # preserve ranked order
         raw = full_profiles.get(pid)
         if raw is None:
             continue
-        profiles.append(_build_profile(pid, score_map.get(pid, 0.0), raw))
+        profiles.append(_build_profile(pid, score_map.get(pid, 0.0), raw, rank))
 
     return {
         "header": {
