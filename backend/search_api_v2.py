@@ -243,13 +243,26 @@ def build_qdrant_filter(query: ParsedQueryV2, client_id: Optional[str] = None) -
             expanded.add(v)  # original
         return list(expanded)
     
-    # Skills - must_have: NOT used as hard Qdrant filter anymore.
-    # Reason: ~50% of profiles have empty skills arrays (original scrapes lacked skills).
-    # These profiles may still be excellent matches (correct title, experience, company).
-    # Skills are instead handled by:
-    #   (1) Semantic embedding similarity (skills added to search_text)
-    #   (2) smart_rerank scoring (exact + text-based skill matching)
-    # This ensures the best profile comes on top regardless of skills array completeness.
+# Skills - HARD FILTER: Require at least 1 matching skill from must_have
+    config = get_config()
+    if query.filters.skills.must_have and len(query.filters.skills.must_have) > 0:
+        expanded_must_have, _ = expand_skills(query.filters.skills.must_have)
+        if expanded_must_have:
+            must_conditions.append(
+                FieldCondition(
+                    key="skills",
+                    match=MatchAny(any=expanded_must_have)
+                )
+            )
+            logger.info(f"Applied skills hard filter: {expanded_must_have[:5]}...")
+    
+    # Skills - exclude (NOT)
+    for skill in filters.skills.exclude:
+        skill_variations = expand_skill_search([skill])
+        skill_variations = with_case_variations(skill_variations)
+        must_not_conditions.append(
+            FieldCondition(key="skills", match=MatchAny(any=skill_variations))
+        )
     
     # Skills - exclude (NOT)
     for skill in filters.skills.exclude:
@@ -297,15 +310,12 @@ def build_qdrant_filter(query: ParsedQueryV2, client_id: Optional[str] = None) -
     # tagged on profiles. Instead, domain is added to search_text for semantic matching.
     # (see smart_search_endpoint where domain is appended to enriched search text)
     
-    # Experience range
-    if filters.experience.min_years is not None:
-        must_conditions.append(
-            FieldCondition(key="years_experience", range=Range(gte=float(filters.experience.min_years)))
-        )
-    if filters.experience.max_years is not None:
-        must_conditions.append(
-            FieldCondition(key="years_experience", range=Range(lte=float(filters.experience.max_years)))
-        )
+    # Experience range — NOT used as hard Qdrant filter.
+    # Reason: many profiles have inaccurate or missing years_experience in Qdrant
+    # payload. Hard-filtering here eliminates good candidates before they can be
+    # rescued by the ranking layer. Experience is instead handled as a ranking
+    # bonus in smart_rerank() so profiles in-range float to the top.
+
 
     # Client isolation — restrict Qdrant results to this client's candidate data
     # NOTE: ~227K legacy points (client 00) lack a client_id field in Qdrant payload
@@ -796,9 +806,9 @@ async def search_v2(query: ParsedQueryV2, client_id: Optional[str] = None) -> Se
     logger.info(f"Search text for embedding: '{search_text[:100]}'")
     
     # 4. Query Qdrant
-    # CRITICAL FIX: Fetch MORE candidates (up to 1000) to ensure we have enough to filter
-    # and to allow accurate pagination. We slice later.
-    SEARCH_FETCH_LIMIT = 1000 
+    # CRITICAL: Fetch a large pool of candidates so the reranker has enough
+    # to work with.  More candidates = better location / skill / title coverage.
+    SEARCH_FETCH_LIMIT = 3000
     t0 = time.time()
     try:
         id_scores = search_qdrant_hybrid(search_text, qdrant_filter, SEARCH_FETCH_LIMIT)
@@ -1114,8 +1124,14 @@ async def search_endpoint(query: ParsedQueryV2, request: Request):
     Accepts parsed query JSON from external LLM API.
     Returns ranked candidates with modified skills.
     """
-    from client_auth import require_client_id as _require_client_id
-    client_id = _require_client_id(request)
+    # Resolve client_id: body field takes priority, then header-based auth
+    from client_auth import require_client_id as _require_client_id, get_client_id as _get_client_id
+    client_id = query.client_id
+    if not client_id:
+        client_id = _get_client_id(request)
+    if not client_id:
+        from config import get_config as _gc
+        client_id = _gc().default_client_id
     response = await search_v2(query, client_id=client_id)
     
     # Add city breakdown
@@ -1648,7 +1664,7 @@ async def summarize_profile_endpoint(request: ProfileSummarizationRequest):
 class SmartSearchQuery(BaseModel):
     """Free-text search query - handles ANY human input"""
     query: str  # "python developers in SF", "ML eng at FAANG", "東京のエンジニア"
-    limit: int = 20
+    limit: int = 50  # Increased default for more results
     location_preference: str = Field(default="preferred", description="Location mode: remote, preferred, or must_match")
     selected_locations: List[str] = Field(default_factory=list, description="Hard filter to these locations")
 
@@ -1858,11 +1874,15 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
         }
     
     # 3. Execute search with parsed query (scoped to client)
-    from client_auth import require_client_id as _get_client_id
+    # Resolve client_id: body field on parsed query takes priority, then header
+    from client_auth import get_client_id as _get_cid
     from fastapi import HTTPException
     if not http_request:
         raise HTTPException(status_code=403, detail="Cannot determine client context.")
-    client_id = _get_client_id(http_request)
+    client_id = getattr(parsed_result, 'client_id', None) or _get_cid(http_request)
+    if not client_id:
+        from config import get_config as _gc
+        client_id = _gc().default_client_id
     logger.info(f"🔍 Executing Qdrant search: text='{parsed_result.search_text[:60]}...', "
                f"skills={parsed_result.filters.skills.must_have[:3]}, "
                f"limit={parsed_result.options.limit}, client='{client_id}'")
@@ -1885,7 +1905,8 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
     else:
         logger.info("✅ After re-ranking: no results")
     
-    # 4b. Experience post-filter — catch profiles with null/stale Qdrant experience data
+    # 4b. Experience post-filter — soft: keep profiles with unknown experience
+    # (they may still be great matches via skills/title/location).
     smart_min = smart_filters.get("min_years")
     smart_max = smart_filters.get("max_years")
     if smart_min is not None or smart_max is not None:
@@ -1893,7 +1914,7 @@ async def smart_search_endpoint(request: SmartSearchQuery, http_request: Request
         def _exp_ok(r):
             yrs = r.years_experience
             if yrs is None:
-                return False
+                return True  # Keep profiles with unknown experience
             if smart_min is not None and yrs < smart_min:
                 return False
             if smart_max is not None and yrs > smart_max:
@@ -2061,15 +2082,28 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
         # ── 1. SKILLS MATCH ──────────────────────────────────────────
         profile_skills = set(s.lower() for s in (result.skills or []))
         
-        # 1a. Exact skill matches in skills[] array (highest confidence)
+        # 1a. Skills matching - EXACT + FUZZY using thefuzz (catches ReactJS ~ React)
+        from thefuzz import fuzz, process
         exact_matches = target_skills & profile_skills
+        fuzzy_matches = set()
+        
+        profile_skill_list = list(profile_skills)  # for fuzzy
+        for target_skill in target_skills - exact_matches:  # only fuzzy unmatched
+            best_match, score = process.extractOne(target_skill, profile_skill_list, scorer=fuzz.ratio)
+            if score >= 80:  # React ~ ReactJS, react.js, React Developer
+                fuzzy_matches.add(best_match)
+                all_matched_skills.append(target_skill)  # credit original target
+        
+        all_profile_skills_matched = exact_matches | fuzzy_matches
         if target_skills:
-            skill_coverage = len(exact_matches) / len(target_skills)
-            skill_bonus = skill_coverage * 0.10
+            skill_coverage = len(all_profile_skills_matched) / len(target_skills)
+            skill_bonus = skill_coverage * 0.12  # Slightly higher for fuzzy rescue
             bonus += skill_bonus
-            all_matched_skills.extend(exact_matches)
+            all_matched_skills.extend(list(all_profile_skills_matched))
             if skill_bonus > 0:
-                bonus_details.append(f"skills+{skill_bonus:.2f}")
+                bonus_details.append(f"skills_fuzzy+{skill_bonus:.2f} ({len(fuzzy_matches)} fuzzy)")
+            logger.debug(f"Fuzzy rescued {len(fuzzy_matches)} skills for {result.full_name}")
+
         
         # 1b. Skills mentioned in headline/description/title/work_history (lower confidence fallback)
         missing_skills = target_skills - exact_matches
@@ -2109,21 +2143,50 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
             if exp_bonus > 0:
                 bonus_details.append(f"expanded+{exp_bonus:.2f}")
         
-        # 1d. RELEVANCE PENALTY — demote profiles with zero skill relevance
-        if target_skills and not all_matched_skills:
-            # Profile matched NONE of the requested skills (array, text, or expanded)
-            bonus -= 0.25
-            bonus_details.append("no_skills-0.25")
+# 1d. SKILLS HARD FILTERING - Use config thresholds
+        config = get_config()
         
-        # 1e. EMPTY PROFILE PENALTY — demote profiles with no useful data
+        # Count total skills (array + text matches)
+        total_skill_matches = len(all_profile_skills_matched | text_matched)
+        
+        # Apply tiered penalties based on skill count
+        if total_skill_matches == 0:
+            bonus += config.no_skills_penalty  # -0.35
+            bonus_details.append(f"no_skills{config.no_skills_penalty:+.2f}")
+            logger.info(f"Hard no-skills penalty: {result.full_name} | skills=0")
+        elif total_skill_matches == 1:
+            bonus += -0.20  # Tier 1 penalty
+            bonus_details.append("1_skill-0.20")
+        elif total_skill_matches < config.min_skills_required:
+            bonus += config.min_skills_penalty  # Configurable
+            bonus_details.append(f"low_skills{config.min_skills_penalty:+.2f}")
+        
+        # Skills coverage score for logging
+        if target_skills:
+            coverage = total_skill_matches / len(target_skills)
+            if coverage < config.min_skills_score:
+                bonus_details.append(f"coverage={coverage:.1f}<{config.min_skills_score}")
+        
+
+        
+        # 1e. SOFT EMPTY PROFILE HANDLING — fallback scan + reduced penalty
         has_headline = bool(result.headline and result.headline.strip() and result.headline.strip() != '--')
         has_summary = bool(result.description and len(result.description.strip()) > 20)
         has_skills = bool(result.skills and len(result.skills) > 0)
         
-        if target_skills and not has_skills and not has_summary:
-            # Profile has no skills AND no meaningful summary — very likely irrelevant
-            bonus -= 0.15
-            bonus_details.append("empty_profile-0.15")
+        if not has_skills:
+            # FALLBACK: Scan headline/summary for relevance without hard penalty
+            profile_fallback_text = f"{result.headline or ''} {result.description or ''} {result.current_title or ''}".lower()
+            fallback_matches = sum(1 for skill in target_skills if skill in profile_fallback_text)
+            if fallback_matches > 0:
+                fallback_bonus = fallback_matches * 0.03  # Small boost for text relevance
+                bonus += fallback_bonus
+                bonus_details.append(f"empty_rescue+{fallback_bonus:.2f}")
+                logger.debug(f"Rescued empty profile {result.full_name} via text: {fallback_matches} hits")
+            elif target_skills:  # Still penalize truly empty/irrelevant
+                bonus -= 0.05  # Reduced from 0.15
+                bonus_details.append("empty_weak-0.05")
+
         
         # 1f. TITLE/HEADLINE RELEVANCE PENALTY — demote profiles whose title/headline
         # are obviously unrelated to the query (e.g. "Piano Teacher" for a "react" search)
@@ -2166,7 +2229,7 @@ def smart_rerank(results: List[CandidateResultV2], filters: Dict, location_prefe
             if location_preference == "must_match":
                 city_boost, state_boost, country_boost = 0.60, 0.30, 0.15
             else:  # "preferred" — strong boost to lift local candidates
-                city_boost, state_boost, country_boost = 0.25, 0.12, 0.06
+                city_boost, state_boost, country_boost = 0.35, 0.15, 0.08
             
             # City matching: prefer exact match, then check linkedin_area/area, then substring
             if target_city:

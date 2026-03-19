@@ -34,7 +34,11 @@ AI-powered candidate search platform for the Japanese job market. Combines seman
     └── nginx-talentin.conf       # Nginx config
 ```
 
+## 📖 Technical Deep Dive
+See [`docs/TECHNICAL_OVERVIEW.md`](docs/TECHNICAL_OVERVIEW.md) for complete explanation of hybrid vectors → cosine similarity → RRF → ranking boosts.
+
 ## Local Development
+
 
 ### Prerequisites
 - Python 3.10+

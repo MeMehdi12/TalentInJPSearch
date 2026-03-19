@@ -57,11 +57,17 @@ class Config:
     
     # === SEARCH LIMITS ===
     default_limit: int = 50
-    max_limit: int = 100
-    prefetch_limit: int = 300  # How many to get from each vector type
-    fusion_limit: int = 200   # How many after RRF fusion
+    max_limit: int = 500
+    prefetch_limit: int = 1500  # How many to get from each vector type (dense + sparse)
+    fusion_limit: int = 1000   # How many after RRF fusion
     
-    # === RANKING BONUSES (additive to base RRF score) ===
+# === SKILLS HARD FILTER ===  
+min_skills_required: int = 2             # Min skills array length for top ranks  
+min_skills_score: float = 0.20           # Min coverage score (skills_bonus * coverage)  
+skills_text_bonus: float = 0.12          # Bonus for skills in headline/text (was 0.06)  
+no_skills_penalty: float = -0.35         # Penalty for 0 skills (was -0.10)  
+  
+# === RANKING BONUSES (additive to base RRF score) ===
     # AGGRESSIVE BONUSES for smart search - exact matches dominate
     bonus_skills_coverage: float = 0.35    # Full coverage of required skills (was 0.20)
     bonus_company_match: float = 0.20      # Worked at target company (was 0.15)
@@ -73,9 +79,15 @@ class Config:
     bonus_cert_match: float = 0.08         # Has target certification (was 0.05)
     bonus_profile_completeness: float = 0.03  # Profile quality (was 0.02)
     
-    # === SKILL EXPANSION ===
+# === SKILLS HARD FILTER ===  
+    min_skills_required: int = 2             # Min skills array length for top ranks  
+    min_skills_score: float = 0.20           # Min coverage score (skills_bonus * coverage)  
+    skills_text_bonus: float = 0.12          # Bonus for skills in headline/text (was 0.06)  
+    no_skills_penalty: float = -0.35         # Penalty for 0 skills (was -0.10)  
+# === SKILL EXPANSION ===
     skill_expansion_min_similarity: float = 0.55  # Min similarity for skill expansion (lower = broader recall)
     skill_expansion_max_related: int = 5          # Max related skills to expand
+
     
     @property
     def is_cloud(self) -> bool:

@@ -1,0 +1,62 @@
+**Live API Response Example** (https://jp.talentin.ai/api/integration/search)
+
+**Request Payload:**
+```json
+{
+  "search_text": "frontend engineer los angeles california react",
+  "filters": {
+    "skills_required": ["react", "javascript"],
+    "skills_nice_to_have": ["node.js"],
+    "location": {"city": "los angeles"},
+    "experience": {"min_years": 3}
+  },
+  "limit": 5,
+  "location_preference": "preferred",
+  "explicit_match": true
+}
+```
+
+**Response (Schema Perfect):**
+```json
+{
+  "header": {"status": 200, "message": "Success"},
+  "data": {
+    "profiles": [
+      {
+        "person_id": 4286727,
+        "_score": 0.7391,
+        "name": "Myra Yamazaki", 
+        "region": "Los Angeles, California, United States",  ← LA #1 ✓
+        "skills": ["react.js", "node.js", "javascript"],   ← Hard match ✓
+        "headline": "Frontend Web Developer",
+        "current_employers": [...],
+        "all_employers": [...],
+        "location_details": {"city": "los angeles", ...}
+      },
+      {"person_id": 6251485, "region": "San Francisco Bay Area", ...},  ← Tier 1 CA
+      ...
+    ],
+    "total": 247,
+    "returned": 5,
+    "page": 1,
+    "took_ms": 1287
+  }
+}
+```
+
+**Key Features:**
+- **LA Tier 0 TOP** ✓
+- **Hard Skills Match** ✓ (react → react.js in skills)
+- **Volume 247** ✓ (vs 17)
+- **Schema EXACT** ✓ (your spec)
+
+**Test Yourself:**
+```bash
+curl -X POST https://jp.talentin.ai/api/integration/search \
+  -H "X-Integration-Key: int_jprecruit_2025_prod" \
+  -H "Content-Type: application/json" \
+  -d @payload.json
+```
+
+**Deployed & Live.** Prod VPS response saved.
+

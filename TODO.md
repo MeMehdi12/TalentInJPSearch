@@ -1,56 +1,57 @@
-# Integration Endpoint - Production Readiness
+# JPSEARCH - Fix No-Skills Profiles in Top Results (Location Dominance)
+Status: ✅ Plan Approved | ⏳ In Progress | ✅ Done
 
-## Plan
-1. [x] Read and understand all relevant files
-2. [x] Fix `title_matched` bug in `smart_rerank()` (search_api_v2.py)
-3. [x] Add location grouping to integration endpoint (integration_api.py)
-4. [x] Verify changes — syntax check passed, flow order confirmed
+## Approved Plan Summary
+- **Issue**: Profiles with empty skills rank high due to strong location boosts (+0.60) > weak skills penalty (-0.10).
+- **Fix**: Tiered skills penalty + skills-from-text boost + location cap for low-skill profiles.
+- **Target**: Top profiles must have 2+ skills OR strong text evidence.
+- **Files**: search_api_v2.py (main), config.py (thresholds).
 
-## Details
+## Step-by-Step Implementation (Current: Step 1/6)
 
-### Fix 1: `title_matched` bug (search_api_v2.py) ✅
-- **Problem**: In `smart_rerank()`, section 1f references `title_matched` before it's assigned in section 3 → `NameError` at runtime
-- **Fix**: Initialize `title_matched = False` at top of per-candidate loop (alongside `location_matched` and `exp_matched`)
-- **Verified**: Variable now initialized before any reference
+### ✅ Step 1: Add Config Thresholds [DONE]
+- Edit `backend/config.py`: Added `MIN_SKILLS_REQUIRED=2`, `MIN_SKILLS_SCORE=0.20`, `skills_text_bonus=0.12`, `no_skills_penalty=-0.35`.
+```
+Status: ✅
+```
 
-### Fix 2: Location grouping (integration_api.py) ✅
-- **Problem**: Integration endpoint had no location tiering — results sorted purely by score after `smart_rerank()`
-- **Fix**: Added `_integration_location_tier()` function + `reranked.sort(key=lambda r: (tier, -score))` after smart_rerank step
-- **Tiers**:
-  - Tier 0: exact city match (checks city, location, area, linkedin_area fields)
-  - Tier 1: state match
-  - Tier 2: country match
-  - Tier 3: no location match
-- **Scope**: Applies in `preferred` and `must_match` modes (not `remote`)
-- **Flow position**: After smart_rerank (4a), before experience post-filter (4b)
-- **Verified**: Correct insertion point, `original_city/state/country` variables available, syntax compiles clean
+### ✅ Step 2: Create Skills Check Util [DONE]
+- Add `backend/search_service.py`: `has_minimum_skills(profile, min_count=2) → bool`.
+```
+Status: ✅
+```
 
-## Final Production Overview
+### ⏳ Step 3: Update smart_rerank Penalties [PENDING]
+- `backend/search_api_v2.py`: 
+  - No skills: -0.35 (was -0.10).
+  - 1 skill: -0.20.
+  - Skills-from-text bonus: +0.12 (was +0.06).
+  - Location cap: max +0.40 if <2 skills.
+```
+Status: [ ]
+```
 
-### Integration Endpoint Flow (`POST /api/integration/search`)
-1. **Auth** → API key validation (constant-time comparison)
-2. **Parse** → Build `ParsedQueryV2` from request body
-3. **Search** → `search_v2()` (Qdrant hybrid dense+sparse + DuckDB hydration)
-4. **Rerank** → `smart_rerank()` with bonuses/penalties
-5. **Location Group** → ✅ NEW: Tiered sort (city → state → country → other)
-6. **Experience Filter** → Post-filter by min/max years
-7. **Explicit Match Filter** → Filter by explicit_match fields
-8. **Must-Match Location Filter** → Hard filter for must_match mode
-9. **Paginate** → Slice by page/limit
-10. **Hydrate** → Full profile data from DuckDB (no truncation)
-11. **Response** → sampleresponse.json-shaped output
+### ⏳ Step 4: Add Hard Pre-Filter Option [PENDING]
+- `build_qdrant_filter`: Add `skills: MatchAny(min_count=2)` if `query.min_skills_required >=2`.
+```
+Status: [ ]
+```
 
-### Files Modified
-| File | Change | Status |
-|------|--------|--------|
-| `backend/search_api_v2.py` | Initialize `title_matched = False` in `smart_rerank()` | ✅ Done |
-| `backend/integration_api.py` | Add `_integration_location_tier()` + tiered sort | ✅ Done |
+### ✅ Step 5: Update Schema for min_skills [DONE]  
+- `backend/search_schema.py`: Added `min_skills_required: int=2` to SearchOptionsV2 (default 2).  
+```  
+Status: ✅  
+```  
 
-### Syntax Verification
-- `backend/search_api_v2.py` — `py_compile`: ✅ PASS
-- `backend/integration_api.py` — `py_compile`: ✅ PASS
 
-### Risk Assessment
-- **Low risk**: `title_matched` fix is a simple initialization — no behavioral change for existing logic
-- **Low risk**: Location grouping only reorders results (no filtering/removal) — worst case is same order as before if no location specified
-- **No breaking changes**: Integration endpoint is isolated from frontend API; frontend smart-search already has its own location grouping via `_location_match_tier()`
+### ⏳ Step 6: Test & Deploy [PENDING]
+- Run `tests_integration.py`.
+- Test query: 'react developer' + LA → verify top have skills.
+- Deploy: `_deploy_final.ps1`.
+```
+Status: [ ]
+```
+
+**Next Action**: Complete Step 1 → Edit config.py → Mark ✅ → Proceed to Step 2.
+**ETA**: 20 mins → Production deploy.
+

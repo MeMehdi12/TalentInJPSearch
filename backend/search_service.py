@@ -26,12 +26,19 @@ class SearchService:
     - DuckDB hydration for full profiles
     """
     
-    def __init__(self):
-        self.config = get_config()
-        self._qdrant: Optional[QdrantClient] = None
-        self._model: Optional[SentenceTransformer] = None
-        self._skill_relations: Optional[Dict[str, List[Tuple[str, float]]]] = None
+    def __init__(self):  
+        self.config = get_config()  
+        self._qdrant: Optional[QdrantClient] = None  
+        self._model: Optional[SentenceTransformer] = None  
+        self._skill_relations: Optional[Dict[str, List[Tuple[str, float]]]] = None  
         
+    def has_minimum_skills(self, profile: Dict, min_count: int = 2) -> bool:  
+        \"\"\"Check if profile meets minimum skills requirement\"\"\"  
+        profile_skills = profile.get('canonical_skills') or []  
+        if isinstance(profile_skills, str):  
+            profile_skills = [profile_skills]  
+        return len([s for s in profile_skills if s.strip()]) >= min_count  
+    
     @property
     def qdrant(self) -> QdrantClient:
         """Lazy load Qdrant client"""

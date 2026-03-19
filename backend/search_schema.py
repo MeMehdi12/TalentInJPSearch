@@ -131,11 +131,13 @@ class FiltersV2(BaseModel):
 
 class SearchOptionsV2(BaseModel):
     """Search options"""
-    limit: int = Field(50, ge=1, le=2000, description="Number of results to return")
-    offset: int = Field(0, ge=0, description="Offset for pagination (number of results to skip)")
-    expand_skills: bool = Field(True, description="Expand skills to related ones using skill_relationships")
+    limit: int = Field(50, ge=1, le=2000, description="Number of results to return")  
+    offset: int = Field(0, ge=0, description="Offset for pagination (number of results to skip)")  
+    expand_skills: bool = Field(True, description="Expand skills to related ones using skill_relationships")  
+    min_skills_required: int = Field(2, ge=0, le=10, description="Hard filter: profiles must have this many skills")  
     location_preference: str = Field("preferred", description="Location mode: 'remote', 'preferred', 'must_match'")
     selected_locations: List[str] = Field(default_factory=list, description="Filter results to these locations only")
+    min_skills_required: int = Field(2, ge=0, le=5, description="Minimum skills count (hard filter for top ranks)")
     
     @field_validator('selected_locations', mode='before')
     @classmethod
@@ -168,9 +170,18 @@ class ParsedQueryV2(BaseModel):
         "options": {"limit": 50, "expand_skills": true}
     }
     """
-    search_text: Optional[str] = Field(None, description="Semantic search text (for embedding)")
+    search_text: Optional[str] = Field(
+        None,
+        description=(
+            "Semantic search text — a natural-language description of the ideal candidate. "
+            "This is encoded into a vector embedding for semantic similarity search. "
+            "It is NOT a keyword filter. Include skills, titles, location, and context "
+            "for the best match. Example: 'senior python backend developer in Tokyo'"
+        )
+    )
     filters: FiltersV2 = Field(default_factory=FiltersV2)
     options: SearchOptionsV2 = Field(default_factory=SearchOptionsV2)
+    client_id: Optional[str] = Field(None, description="Tenant scope — overrides header-based client_id if provided")
 
 
 # ============================================================================

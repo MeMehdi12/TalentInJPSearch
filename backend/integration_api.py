@@ -213,8 +213,8 @@ class IntegrationSearchRequest(BaseModel):
         description="Location handling mode: 'preferred' (semantic boost, no hard filter), "
                     "'must_match' (strict location filter), 'remote' (ignore location entirely)",
     )
-    explicit_match: bool = Field(
-        False,
+explicit_match: bool = Field(
+        True, description="Default HARD skill matching ON - required skills MUST exist in profile.skills"),
         description="When true, enforce strict filtering: all required skills must appear "
                     "in profile skills, and job titles must match current title or headline",
     )
@@ -695,7 +695,7 @@ async def integration_search(body: IntegrationSearchRequest, request: Request):
         qdrant_city = qdrant_state = qdrant_country = None
 
     # ── Fetch extra candidates for re-ranking / post-filter headroom ─────────
-    fetch_limit = min(body.limit * 5, 500)
+fetch_limit = min(body.limit * 10, 2000)  # HARD skills + large pool
     if body.location_preference == "must_match" or body.explicit_match:
         fetch_limit = min(body.limit * 10, 1000)
 
@@ -783,6 +783,24 @@ async def integration_search(body: IntegrationSearchRequest, request: Request):
         search_result.results, smart_filters, body.location_preference
     )
 
+    # ── 4-pre. Hard relevance cutoff — remove truly irrelevant profiles ──────
+    # After smart_rerank applies bonuses/penalties, profiles that don't match
+    # the search context (wrong skills, wrong title, empty) end up with low
+    # scores. We remove them entirely so ALL returned results are relevant.
+    #
+    # Score anatomy after smart_rerank:
+    #   Relevant profile:   base ~0.55-0.75 + skill/title bonuses → 0.50-0.95
+    #   Irrelevant profile: base ~0.40-0.55 - no_skills(-0.25) - no_relevance(-0.12) → 0.05-0.25
+    #
+    # Threshold 0.35 keeps profiles with at least partial skill/title match.
+    _MIN_RELEVANCE_SCORE = 0.25
+    before_cutoff = len(reranked)
+    reranked = [r for r in reranked if r.score >= _MIN_RELEVANCE_SCORE]
+    if before_cutoff != len(reranked):
+        logger.info("Relevance cutoff (%.2f): %d → %d candidates removed %d irrelevant",
+                     _MIN_RELEVANCE_SCORE, before_cutoff, len(reranked),
+                     before_cutoff - len(reranked))
+
     # ── 4a. Location grouping — group exact-location matches at the top ──────────
     # Applies in both "preferred" and "must_match" modes (not "remote").
     # Within each tier, candidates are sorted by score (highest first).
@@ -840,7 +858,7 @@ async def integration_search(body: IntegrationSearchRequest, request: Request):
         def _exp_passes(r):
             yrs = r.years_experience
             if yrs is None:
-                return False  # Unknown experience doesn't pass strict filter
+                return True  # Keep profiles with unknown experience
             if exp.min_years is not None and yrs < exp.min_years:
                 return False
             if exp.max_years is not None and yrs > exp.max_years:

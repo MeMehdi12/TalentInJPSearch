@@ -27,6 +27,7 @@ pyarrow==15.0.0        # Parquet support for DuckDB
 
 # --- Text Processing & Search ---
 rapidfuzz==3.6.0       # Fuzzy matching for company/skill normalization
+thefuzz[rapidfuzz]==0.22.0  # Fuzzy string matching for skills (React ~ ReactJS)
 
 # --- Optional Production ---
 python-multipart==0.0.9  # File uploads support
